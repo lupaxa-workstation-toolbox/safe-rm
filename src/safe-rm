@@ -1,0 +1,3642 @@
+#!/usr/bin/env bash
+#
+# safe-rm — recoverable replacement for interactive rm and rmdir.
+#
+# One Bash 3.2+ executable. Metadata, journals, locks, and logs are data
+# files under the private store. This script is not a transparent stand-in
+# for every GNU/BSD rm option, and it is not a backup or a secure-erase tool.
+#
+# Limits (also in --help): cooperative same-user writers only. Bash and
+# pathname tools cannot close every time-of-check/time-of-use race or give
+# fsync durability. Power loss is limited to what the filesystem actually
+# provides. Version 1 refuses effective UID 0.
+#
+# shellcheck shell=bash
+
+SAFE_RM_VERSION="0.0.0"
+
+set -u
+set -o pipefail
+
+export LC_ALL=C
+export LANG=C
+
+SCHEMA_VERSION=1 # used by JSON emitters
+META_VERSION=1
+LOG_VERSION=1
+
+EC_OK=0
+EC_FAIL=1
+EC_USAGE=2
+EC_SAFETY=3
+EC_LOCK=4
+EC_INTEGRITY=5
+EC_CAPABILITY=6
+
+MODE="trash"
+ACTION_SET=0
+DRY_RUN=0
+VERBOSE=0
+QUIET=0
+DEBUG_FLAG=0
+JSON_FLAG=0
+RECURSIVE=0
+DIR_FLAG=0
+PARENTS=0
+IGNORE_NONEMPTY=0
+PROMPT_MODE=""
+CONFIG_PATH=""
+CONFIG_EXPLICIT=0
+LONG_LIST=0
+OLDEST_FIRST=0
+LIST_QUARANTINE=0
+DOCTOR_REPAIR=0
+RESTORE_CREATE_PARENTS=0
+RESTORE_RENAME=0
+RESTORE_OVERWRITE=0
+IGNORE_CHECKSUM=0
+PRESERVE_ROOT_FLAG=0
+ONE_FS_FLAG=0
+OLDER_THAN_ARG=""
+MAX_SIZE_ARG=""
+RESTORE_TO=""
+END_OPTS=0
+
+FINAL_STATUS=0
+STATUS_RANK=0
+OK_COUNT=0
+FAIL_COUNT=0
+LOCK_HELD=0
+LOCK_TOKEN=""
+CLEANED_UP=0
+SIGNAL_STATUS=0
+CHILD_PID=""
+STORE_READY=0
+SELF_PATH=""
+STAT_STYLE=""
+SYS_RM=""
+SYS_RMDIR=""
+SYS_MV=""
+SYS_CP=""
+HASH_CMD=""
+HASH_STYLE=""
+
+TRASH_BASE_VALUE=""
+TRASH_MAX_DAYS_VALUE="30"
+TRASH_MAX_SIZE_VALUE="10GiB"
+TRASH_CHECKSUM_VALUE="auto"
+TRASH_CHECKSUM_MAX_VALUE="1GiB"
+TRASH_AUTO_PURGE_VALUE="false"
+TRASH_AUTO_PURGE_INTERVAL_VALUE="3600"
+TRASH_LOG_MAX_VALUE="10MiB"
+TRASH_LOG_ROTATIONS_VALUE="3"
+TRASH_LOCK_TIMEOUT_VALUE="10"
+TRASH_INTERACTIVE_VALUE="default"
+TRASH_PROTECT_VALUE=""
+
+ENV_SET_TRASH_BASE=0
+ENV_SET_TRASH_MAX_DAYS=0
+ENV_SET_TRASH_MAX_SIZE=0
+ENV_SET_TRASH_CHECKSUM=0
+ENV_SET_TRASH_CHECKSUM_MAX=0
+ENV_SET_TRASH_AUTO_PURGE=0
+ENV_SET_TRASH_AUTO_PURGE_INTERVAL=0
+ENV_SET_TRASH_LOG_MAX=0
+ENV_SET_TRASH_LOG_ROTATIONS=0
+ENV_SET_TRASH_LOCK_TIMEOUT=0
+ENV_SET_TRASH_INTERACTIVE=0
+ENV_SET_TRASH_PROTECT=0
+
+USER_HOME=""
+USER_UID=""
+CWD_PHYS=""
+STORE_PATH=""
+STORE_ID=""
+HOST_NAME=""
+
+OPERANDS=()
+OK_PATHS=()
+FAIL_PATHS=()
+WARNINGS=()
+JSON_ERRORS=()
+SELECT_IDS=()
+
+NORM_PATH=""
+ENCODED=""
+DECODED=""
+
+umask 077
+
+snapshot_env() {
+    if [ "${TRASH_BASE+x}" = x ]; then ENV_SET_TRASH_BASE=1; fi
+    if [ "${TRASH_MAX_DAYS+x}" = x ]; then ENV_SET_TRASH_MAX_DAYS=1; fi
+    if [ "${TRASH_MAX_SIZE+x}" = x ]; then ENV_SET_TRASH_MAX_SIZE=1; fi
+    if [ "${TRASH_CHECKSUM+x}" = x ]; then ENV_SET_TRASH_CHECKSUM=1; fi
+    if [ "${TRASH_CHECKSUM_MAX_SIZE+x}" = x ]; then ENV_SET_TRASH_CHECKSUM_MAX=1; fi
+    if [ "${TRASH_AUTO_PURGE+x}" = x ]; then ENV_SET_TRASH_AUTO_PURGE=1; fi
+    if [ "${TRASH_AUTO_PURGE_INTERVAL+x}" = x ]; then ENV_SET_TRASH_AUTO_PURGE_INTERVAL=1; fi
+    if [ "${TRASH_LOG_MAX_SIZE+x}" = x ]; then ENV_SET_TRASH_LOG_MAX=1; fi
+    if [ "${TRASH_LOG_ROTATIONS+x}" = x ]; then ENV_SET_TRASH_LOG_ROTATIONS=1; fi
+    if [ "${TRASH_LOCK_TIMEOUT+x}" = x ]; then ENV_SET_TRASH_LOCK_TIMEOUT=1; fi
+    if [ "${TRASH_INTERACTIVE+x}" = x ]; then ENV_SET_TRASH_INTERACTIVE=1; fi
+    if [ "${TRASH_PROTECT_PATHS+x}" = x ]; then ENV_SET_TRASH_PROTECT=1; fi
+    USER_HOME=${HOME:-}
+    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+        USER_HOME=$(CDPATH='' cd -P -- "$USER_HOME" && pwd -P) || true
+    fi
+    USER_UID=$(id -u)
+    HOST_NAME=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
+}
+
+debug() {
+    if [ "$DEBUG_FLAG" -eq 1 ]; then
+        printf 'safe-rm: debug: %s\n' "$1" >&2
+    fi
+}
+
+warn() {
+    WARNINGS+=("$1")
+    if [ "$JSON_FLAG" -eq 0 ] || [ "$QUIET" -eq 0 ]; then
+        printf 'safe-rm: warning: %s\n' "$1" >&2
+    fi
+}
+
+say_err() {
+    printf 'safe-rm: %s\n' "$1" >&2
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        JSON_ERRORS+=("$1")
+    fi
+}
+
+rank_of() {
+    case "$1" in
+        5) printf '50' ;;
+        3) printf '40' ;;
+        6) printf '30' ;;
+        4) printf '20' ;;
+        2) printf '15' ;;
+        1) printf '10' ;;
+        *) printf '0' ;;
+    esac
+}
+
+note_status() {
+    local code="$1" rank
+    rank=$(rank_of "$code")
+    if [ "$rank" -gt "$STATUS_RANK" ]; then
+        STATUS_RANK=$rank
+        FINAL_STATUS=$code
+    fi
+}
+
+die() {
+    local code="$1"
+    shift
+    say_err "$*"
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        emit_json_error "$code"
+    fi
+    exit "$code"
+}
+
+inject_fail() {
+    local point="$1"
+    if [ "${SAFE_RM_TEST_HOOK:-}" != "1" ]; then
+        return 0
+    fi
+    if [ "${SAFE_RM_INJECT:-}" = "$point" ]; then
+        printf 'safe-rm: injected failure at %s\n' "$point" >&2
+        exit "$EC_INTEGRITY"
+    fi
+}
+
+# shellcheck disable=SC2329  # invoked via trap
+on_signal() {
+    SIGNAL_STATUS=$1
+    if [ -n "$CHILD_PID" ]; then
+        kill -s TERM "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+        CHILD_PID=""
+    fi
+    exit "$1"
+}
+
+release_lock_if_owned() {
+    if [ "$LOCK_HELD" -ne 1 ] || [ -z "$LOCK_TOKEN" ] || [ -z "$STORE_PATH" ]; then
+        return 0
+    fi
+    local meta tok
+    meta="$STORE_PATH/.lock/meta"
+    if [ ! -f "$meta" ] || [ -L "$meta" ]; then
+        LOCK_HELD=0
+        return 0
+    fi
+    tok=$(awk -F= '$1=="Token"{print substr($0,index($0,"=")+1)}' "$meta" 2>/dev/null || true)
+    if [ "$tok" != "$LOCK_TOKEN" ]; then
+        LOCK_HELD=0
+        return 0
+    fi
+    if [ -n "$SYS_RM" ]; then
+        "$SYS_RM" -f -- "$meta" 2>/dev/null || true
+    else
+        rm -f -- "$meta" 2>/dev/null || true
+    fi
+    rmdir "$STORE_PATH/.lock" 2>/dev/null || true
+    LOCK_HELD=0
+}
+
+# shellcheck disable=SC2329  # invoked via trap
+on_exit() {
+    local status=$?
+    if [ "$CLEANED_UP" -eq 1 ]; then
+        return 0
+    fi
+    CLEANED_UP=1
+    release_lock_if_owned
+    if [ "$SIGNAL_STATUS" -ne 0 ]; then
+        exit "$SIGNAL_STATUS"
+    fi
+    return "$status"
+}
+
+trap 'on_exit' EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+trim_ascii() {
+    local s="$1"
+    while true; do
+        case "$s" in
+            [$' \t']*) s=${s#?} ;;
+            *) break ;;
+        esac
+    done
+    while true; do
+        case "$s" in
+            *[$' \t']) s=${s%?} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$s"
+}
+
+strip_matching_quotes() {
+    local s="$1" n first last
+    n=${#s}
+    if [ "$n" -ge 2 ]; then
+        first=${s:0:1}
+        last=${s:$((n - 1)):1}
+        if [ "$first" = "$last" ] && { [ "$first" = "'" ] || [ "$first" = '"' ]; }; then
+            printf '%s' "${s:1:$((n - 2))}"
+            return 0
+        fi
+    fi
+    printf '%s' "$s"
+}
+
+# shellcheck disable=SC1003
+json_escape() {
+    local s="$1" i=0 n c hex out=""
+    n=${#s}
+    while [ "$i" -lt "$n" ]; do
+        c=${s:$i:1}
+        case "$c" in
+            '"') out="${out}\\\"" ;;
+            '\\') out="${out}\\\\" ;;
+            $'\n') out="${out}\\n" ;;
+            $'\r') out="${out}\\r" ;;
+            $'\t') out="${out}\\t" ;;
+            [[:cntrl:]])
+                printf -v hex '%02X' "'$c"
+                out="${out}\\u00${hex}"
+                ;;
+            *) out="${out}${c}" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+# shellcheck disable=SC1003
+display_escape() {
+    local s="$1" i=0 n c o hex
+    n=${#s}
+    o=""
+    while [ "$i" -lt "$n" ]; do
+        c=${s:$i:1}
+        case "$c" in
+            '\\') o="${o}\\\\" ;;
+            $'\n') o="${o}\\n" ;;
+            $'\r') o="${o}\\r" ;;
+            $'\t') o="${o}\\t" ;;
+            [[:cntrl:]])
+                printf -v hex '%02X' "'$c"
+                o="${o}\\x${hex}"
+                ;;
+            *) o="${o}${c}" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s' "$o"
+}
+
+utf8_ok() {
+    if ! command -v iconv >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1
+}
+
+percent_encode_stream() {
+    LC_ALL=C od -An -v -tx1 | awk '
+        BEGIN {
+            ORS = ""
+            hex = "0123456789ABCDEF"
+            for (i = 0; i < 16; i++) {
+                val[substr(hex, i + 1, 1)] = i
+            }
+        }
+        function hexbyte(h,    a, b) {
+            h = toupper(h)
+            if (length(h) == 1) h = "0" h
+            a = substr(h, 1, 1)
+            b = substr(h, 2, 1)
+            return val[a] * 16 + val[b]
+        }
+        {
+            for (i = 1; i <= NF; i++) {
+                h = toupper($i)
+                if (length(h) == 1) h = "0" h
+                c1 = substr(h, 1, 1)
+                enc = 0
+                if (h == "25" || h == "3D" || h == "7F") enc = 1
+                if (c1 == "0" || c1 == "1" || c1 ~ /[89A-F]/) enc = 1
+                if (enc) printf "%%%s", h
+                else printf "%c", hexbyte(h)
+            }
+        }
+    '
+}
+
+percent_encode_var() {
+    ENCODED=$(printf '%s' "$1" | percent_encode_stream)
+}
+
+percent_decode_var() {
+    local s="$1" i=0 n c hex byte
+    DECODED=""
+    n=${#s}
+    while [ "$i" -lt "$n" ]; do
+        c=${s:$i:1}
+        if [ "$c" = "%" ]; then
+            if [ $((i + 2)) -ge "$n" ]; then
+                return 1
+            fi
+            hex=${s:$((i + 1)):2}
+            case "$hex" in
+                [0-9A-F][0-9A-F]) ;;
+                *) return 1 ;;
+            esac
+            if [ "$hex" = "00" ]; then
+                return 1
+            fi
+            printf -v byte '%b' "\\x${hex}"
+            DECODED="${DECODED}${byte}"
+            i=$((i + 3))
+        else
+            case "$c" in
+                [[:cntrl:]]) return 1 ;;
+            esac
+            DECODED="${DECODED}${c}"
+            i=$((i + 1))
+        fi
+    done
+    return 0
+}
+
+literal_contains() {
+    local hay="$1" needle="$2"
+    if [ -z "$needle" ]; then
+        return 0
+    fi
+    [ "${hay#*"$needle"}" != "$hay" ]
+}
+
+detect_stat() {
+    if stat -f '%i' / >/dev/null 2>&1; then
+        STAT_STYLE=bsd
+        return 0
+    fi
+    if stat -c '%i' / >/dev/null 2>&1; then
+        STAT_STYLE=gnu
+        return 0
+    fi
+    return 1
+}
+
+stat_field() {
+    local fmt_bsd="$1" fmt_gnu="$2" path="$3"
+    if [ "$STAT_STYLE" = bsd ]; then
+        stat -f "$fmt_bsd" -- "$path" 2>/dev/null
+    else
+        stat -c "$fmt_gnu" -- "$path" 2>/dev/null
+    fi
+}
+
+stat_inode() { stat_field '%i' '%i' "$1"; }
+stat_device() { stat_field '%d' '%d' "$1"; }
+stat_uid() { stat_field '%u' '%u' "$1"; }
+stat_gid() { stat_field '%g' '%g' "$1"; }
+stat_size() { stat_field '%z' '%s' "$1"; }
+# shellcheck disable=SC2329
+stat_mtime() { stat_field '%m' '%Y' "$1"; }
+stat_nlink() { stat_field '%l' '%h' "$1"; }
+stat_blocks() { stat_field '%b' '%b' "$1"; }
+# shellcheck disable=SC2329
+stat_flags() {
+    if [ "$STAT_STYLE" = bsd ]; then
+        stat -f '%f' -- "$1" 2>/dev/null || printf '0'
+    else
+        printf '0'
+    fi
+}
+
+stat_mode_octal() {
+    local raw n
+    if [ "$STAT_STYLE" = bsd ]; then
+        raw=$(stat -f '%p' -- "$1") || return 1
+        n=${#raw}
+        if [ "$n" -gt 4 ]; then
+            raw=${raw:$((n - 4)):4}
+        fi
+    else
+        raw=$(stat -c '%a' -- "$1") || return 1
+    fi
+    printf '%s' "$raw"
+}
+
+stat_type_letter() {
+    local p="$1"
+    if [ -L "$p" ]; then
+        printf 'l'
+    elif [ -d "$p" ]; then
+        printf 'd'
+    elif [ -f "$p" ]; then
+        printf 'f'
+    elif [ -p "$p" ]; then
+        printf 'p'
+    elif [ -S "$p" ]; then
+        printf 's'
+    elif [ -b "$p" ] || [ -c "$p" ]; then
+        printf 'b'
+    else
+        printf '?'
+    fi
+}
+
+# shellcheck disable=SC2329
+object_type_name() {
+    case "$1" in
+        f) printf 'file' ;;
+        d) printf 'directory' ;;
+        l) printf 'symlink' ;;
+        *) printf 'special' ;;
+    esac
+}
+
+detect_hash() {
+    if command -v shasum >/dev/null 2>&1; then
+        HASH_CMD=$(command -v shasum)
+        HASH_STYLE=shasum
+        return 0
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        HASH_CMD=$(command -v sha256sum)
+        HASH_STYLE=sha256sum
+        return 0
+    fi
+    return 1
+}
+
+sha256_file() {
+    local file="$1" line digest
+    if [ -z "$HASH_CMD" ]; then
+        return 1
+    fi
+    if [ "$HASH_STYLE" = shasum ]; then
+        line=$("$HASH_CMD" -a 256 <"$file" 2>/dev/null) || return 1
+    else
+        line=$("$HASH_CMD" <"$file" 2>/dev/null) || return 1
+    fi
+    digest=${line%% *}
+    case "$digest" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+        *) return 1 ;;
+    esac
+    if [ ${#digest} -ne 64 ]; then
+        return 1
+    fi
+    printf '%s' "$digest"
+}
+
+# shellcheck disable=SC2329
+sha256_string() {
+    local line digest
+    if [ -z "$HASH_CMD" ]; then
+        return 1
+    fi
+    if [ "$HASH_STYLE" = shasum ]; then
+        line=$(printf '%s' "$1" | "$HASH_CMD" -a 256) || return 1
+    else
+        line=$(printf '%s' "$1" | "$HASH_CMD") || return 1
+    fi
+    digest=${line%% *}
+    case "$digest" in
+        [0-9a-f]*) ;;
+        *) return 1 ;;
+    esac
+    if [ ${#digest} -ne 64 ]; then
+        return 1
+    fi
+    printf '%s' "$digest"
+}
+
+resolve_self() {
+    local dir base
+    dir=$(dirname -- "$0") || return 1
+    base=$(basename -- "$0") || return 1
+    dir=$(CDPATH='' cd -P -- "$dir" && pwd -P) || return 1
+    SELF_PATH="${dir}/${base}"
+}
+
+same_inode() {
+    local a b
+    a=$(stat_device "$1"):$(stat_inode "$1") || return 1
+    b=$(stat_device "$2"):$(stat_inode "$2") || return 1
+    [ "$a" = "$b" ]
+}
+
+resolve_follow() {
+    local p="$1" i=0 next dir
+    while [ -L "$p" ] && [ "$i" -lt 8 ]; do
+        next=$(readlink -- "$p") || return 1
+        case "$next" in
+            /*) p=$next ;;
+            *)
+                dir=$(dirname -- "$p")
+                p="${dir}/${next}"
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s' "$p"
+}
+
+resolve_tool() {
+    local c final
+    for c in "$@"; do
+        [ -e "$c" ] || continue
+        [ -x "$c" ] || continue
+        final=$(resolve_follow "$c") || continue
+        [ -f "$final" ] || continue
+        [ -x "$final" ] || continue
+        case "$final" in
+            /bin/*|/usr/bin/*|/usr/sbin/*) ;;
+            *) continue ;;
+        esac
+        if same_inode "$final" "$SELF_PATH"; then
+            continue
+        fi
+        printf '%s' "$c"
+        return 0
+    done
+    return 1
+}
+
+ensure_tools() {
+    if [ -z "$SYS_RM" ]; then
+        SYS_RM=$(resolve_tool /bin/rm /usr/bin/rm) || die "$EC_CAPABILITY" "could not resolve a system rm under /bin or /usr/bin"
+    fi
+    if [ -z "$SYS_RMDIR" ]; then
+        SYS_RMDIR=$(resolve_tool /bin/rmdir /usr/bin/rmdir) || die "$EC_CAPABILITY" "could not resolve a system rmdir under /bin or /usr/bin"
+    fi
+    if [ -z "$SYS_MV" ]; then
+        SYS_MV=$(resolve_tool /bin/mv /usr/bin/mv) || die "$EC_CAPABILITY" "could not resolve a system mv under /bin or /usr/bin"
+    fi
+    if [ -z "$SYS_CP" ]; then
+        SYS_CP=$(resolve_tool /bin/cp /usr/bin/cp) || die "$EC_CAPABILITY" "could not resolve a system cp under /bin or /usr/bin"
+    fi
+}
+
+require_hash() {
+    if [ -z "$HASH_CMD" ]; then
+        detect_hash || die "$EC_CAPABILITY" "SHA-256 is required (shasum -a 256 or sha256sum) and was not found"
+    fi
+}
+
+gen_hex() {
+    local nbytes="$1" hex
+    if [ ! -r /dev/urandom ]; then
+        return 1
+    fi
+    hex=$(od -An -N "$nbytes" -tx1 /dev/urandom | tr -d ' \n' | tr '[:upper:]' '[:lower:]') || return 1
+    if [ ${#hex} -ne $((nbytes * 2)) ]; then
+        return 1
+    fi
+    printf '%s' "$hex"
+}
+
+gen_id() {
+    local raw hex
+    if command -v uuidgen >/dev/null 2>&1; then
+        raw=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+        case "$raw" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-????????-????-????-????????????)
+                printf '%s' "$raw"
+                return 0
+                ;;
+        esac
+    fi
+    hex=$(gen_hex 16) || return 1
+    printf '%s-%s-%s-%s-%s' \
+        "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+}
+
+valid_id() {
+    local s="$1" hex
+    case "$s" in
+        ????????-????-????-????-????????????) ;;
+        *) return 1 ;;
+    esac
+    hex=$(printf '%s' "$s" | tr -d '-')
+    case "$hex" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#hex}" -eq 32 ]
+}
+
+parse_size() {
+    local raw="$1" result
+    result=$(awk -v raw="$raw" '
+        BEGIN {
+            if (raw ~ /[^0-9A-Za-z.]/) exit 2
+            if (match(raw, /[A-Za-z]+$/)) {
+                unit = substr(raw, RSTART, RLENGTH)
+                num = substr(raw, 1, RSTART - 1)
+            } else {
+                unit = "B"
+                num = raw
+            }
+            if (num == "" || num ~ /^\./ || num ~ /\.$/ || num ~ /\..*\./) exit 2
+            ul = tolower(unit)
+            mult = -1
+            if (ul == "b") mult = 1
+            else if (ul == "k" || ul == "kib") mult = 1024
+            else if (ul == "kb") mult = 1000
+            else if (ul == "m" || ul == "mib") mult = 1048576
+            else if (ul == "mb") mult = 1000000
+            else if (ul == "g" || ul == "gib") mult = 1073741824
+            else if (ul == "gb") mult = 1000000000
+            else if (ul == "t" || ul == "tib") mult = 1099511627776
+            else if (ul == "tb") mult = 1000000000000
+            if (mult < 0) exit 2
+            if (num ~ /\./) {
+                split(num, a, ".")
+                whole = a[1] + 0
+                frac = a[2]
+                if (frac ~ /[^0-9]/) exit 2
+                scale = 1
+                for (i = 1; i <= length(frac); i++) scale *= 10
+                numer = frac + 0
+                add = int((numer * mult + scale - 1) / scale)
+                result = whole * mult + add
+            } else {
+                if (num ~ /[^0-9]/) exit 2
+                result = (num + 0) * mult
+            }
+            if (result < 0 || result > 4503599627370496) exit 2
+            printf "%.0f", result
+        }
+    ') || return 1
+    is_uint "$result" || return 1
+    printf '%s' "$result"
+}
+
+format_iec() {
+    local n="$1" unit="B" scaled="$1" rem=0
+    if ! is_uint "$n"; then
+        printf 'unknown'
+        return 0
+    fi
+    if [ "$n" -ge 1099511627776 ]; then
+        unit=TiB
+        scaled=$((n / 1099511627776))
+        rem=$(((n % 1099511627776) / 109951162777))
+    elif [ "$n" -ge 1073741824 ]; then
+        unit=GiB
+        scaled=$((n / 1073741824))
+        rem=$(((n % 1073741824) / 107374182))
+    elif [ "$n" -ge 1048576 ]; then
+        unit=MiB
+        scaled=$((n / 1048576))
+        rem=$(((n % 1048576) / 104857))
+    elif [ "$n" -ge 1024 ]; then
+        unit=KiB
+        scaled=$((n / 1024))
+        rem=$(((n % 1024) / 102))
+    else
+        printf '%s B' "$n"
+        return 0
+    fi
+    printf '%s.%s %s' "$scaled" "$rem" "$unit"
+}
+
+parse_age() {
+    local raw="$1" n unit
+    case "$raw" in
+        *d) unit=d; n=${raw%d} ;;
+        *h) unit=h; n=${raw%h} ;;
+        *) return 1 ;;
+    esac
+    is_uint "$n" || return 1
+    if [ "$unit" = d ]; then
+        if [ "$n" -gt 2000000000 ]; then
+            return 1
+        fi
+        printf '%s' $((n * 86400))
+    else
+        if [ "$n" -gt 20000000000 ]; then
+            return 1
+        fi
+        printf '%s' $((n * 3600))
+    fi
+}
+
+utc_stamp() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+epoch_now() {
+    date -u +%s
+}
+
+have_tty() {
+    [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+prompt_line() {
+    local msg="$1" ans
+    if ! have_tty; then
+        return 2
+    fi
+    printf '%s' "$msg" >/dev/tty
+    if ! IFS= read -r ans </dev/tty; then
+        return 2
+    fi
+    case "$ans" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+usage() {
+    say_err "$1"
+    say_err "Run safe-rm --help for usage."
+    exit "$EC_USAGE"
+}
+
+set_action() {
+    local name="$1"
+    if [ "$ACTION_SET" -eq 1 ]; then
+        usage "conflicting action flags"
+    fi
+    MODE=$name
+    ACTION_SET=1
+}
+
+set_verbose() {
+    if [ "$QUIET" -eq 1 ]; then
+        usage "quiet and verbose are mutually exclusive"
+    fi
+    VERBOSE=1
+}
+
+set_quiet() {
+    if [ "$VERBOSE" -eq 1 ]; then
+        usage "quiet and verbose are mutually exclusive"
+    fi
+    QUIET=1
+}
+
+# shellcheck disable=SC2329
+need_value() {
+    local opt="$1" idx="$2"
+    if [ "$idx" -ge ${#OPERAND_ARGS[@]} ]; then
+        usage "missing value for $opt"
+    fi
+}
+
+parse_short_cluster() {
+    local cluster="$1" c
+    cluster=${cluster#-}
+    while [ -n "$cluster" ]; do
+        c=${cluster:0:1}
+        cluster=${cluster:1}
+        case "$c" in
+            f) PROMPT_MODE=f ;;
+            i) PROMPT_MODE=i ;;
+            I) PROMPT_MODE=I ;;
+            r|R) RECURSIVE=1 ;;
+            d) DIR_FLAG=1 ;;
+            v) set_verbose ;;
+            q) set_quiet ;;
+            p) PARENTS=1 ;;
+            h) set_action help ;;
+            *) usage "unknown option -$c" ;;
+        esac
+    done
+}
+
+take_opt_value() {
+    local opt="$1" raw="$2"
+    case "$opt" in
+        --config)
+            CONFIG_PATH=$raw
+            CONFIG_EXPLICIT=1
+            ;;
+        --to)
+            RESTORE_TO=$raw
+            ;;
+        --older-than)
+            OLDER_THAN_ARG=$raw
+            ;;
+        --max-size)
+            MAX_SIZE_ARG=$raw
+            ;;
+        *) usage "unexpected value option $opt" ;;
+    esac
+}
+
+parse_args() {
+    local i=0 a opt raw
+    OPERAND_ARGS=("$@")
+    while [ "$i" -lt ${#OPERAND_ARGS[@]} ]; do
+        a=${OPERAND_ARGS[$i]}
+        if [ "$END_OPTS" -eq 1 ]; then
+            OPERANDS+=("$a")
+            i=$((i + 1))
+            continue
+        fi
+        case "$a" in
+            --)
+                END_OPTS=1
+                ;;
+            --help|-help)
+                set_action help
+                ;;
+            --version)
+                set_action version
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --verbose)
+                set_verbose
+                ;;
+            --quiet)
+                set_quiet
+                ;;
+            --debug)
+                DEBUG_FLAG=1
+                ;;
+            --json)
+                JSON_FLAG=1
+                ;;
+            --force)
+                PROMPT_MODE=f
+                ;;
+            --recursive)
+                RECURSIVE=1
+                ;;
+            --dir)
+                DIR_FLAG=1
+                ;;
+            --preserve-root)
+                PRESERVE_ROOT_FLAG=1
+                ;;
+            --one-file-system)
+                ONE_FS_FLAG=1
+                ;;
+            --no-preserve-root)
+                usage "refusing --no-preserve-root; root protection is mandatory"
+                ;;
+            --rmdir)
+                set_action rmdir
+                ;;
+            --parents)
+                PARENTS=1
+                ;;
+            --ignore-fail-on-non-empty)
+                IGNORE_NONEMPTY=1
+                ;;
+            --list)
+                set_action list
+                ;;
+            --long)
+                LONG_LIST=1
+                ;;
+            --oldest-first)
+                OLDEST_FIRST=1
+                ;;
+            --quarantine)
+                LIST_QUARANTINE=1
+                ;;
+            --info)
+                set_action info
+                ;;
+            --restore)
+                set_action restore
+                ;;
+            --create-parents)
+                RESTORE_CREATE_PARENTS=1
+                ;;
+            --rename)
+                RESTORE_RENAME=1
+                ;;
+            --overwrite)
+                RESTORE_OVERWRITE=1
+                ;;
+            --ignore-checksum)
+                IGNORE_CHECKSUM=1
+                ;;
+            --delete)
+                set_action delete
+                ;;
+            --empty)
+                set_action empty
+                ;;
+            --purge)
+                set_action purge
+                ;;
+            --stats)
+                set_action stats
+                ;;
+            --doctor)
+                set_action doctor
+                ;;
+            --repair)
+                DOCTOR_REPAIR=1
+                ;;
+            --permanent)
+                set_action permanent
+                ;;
+            --config=*|--to=*|--older-than=*|--max-size=*)
+                opt=${a%%=*}
+                raw=${a#*=}
+                take_opt_value "$opt" "$raw"
+                ;;
+            --config|--to|--older-than|--max-size)
+                i=$((i + 1))
+                if [ "$i" -ge ${#OPERAND_ARGS[@]} ]; then
+                    usage "missing value for $a"
+                fi
+                take_opt_value "$a" "${OPERAND_ARGS[$i]}"
+                ;;
+            --*)
+                usage "unknown option $a"
+                ;;
+            -)
+                OPERANDS+=("$a")
+                ;;
+            -*)
+                parse_short_cluster "$a"
+                ;;
+            *)
+                OPERANDS+=("$a")
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ "$RESTORE_RENAME" -eq 1 ] && [ "$RESTORE_OVERWRITE" -eq 1 ]; then
+        usage "--rename and --overwrite are mutually exclusive"
+    fi
+}
+
+validate_mode_flags() {
+    local n=${#OPERANDS[@]}
+    case "$MODE" in
+        help|version)
+            if [ "$n" -ne 0 ]; then
+                usage "surplus operands"
+            fi
+            ;;
+        trash|permanent)
+            if [ "$PARENTS" -eq 1 ] || [ "$IGNORE_NONEMPTY" -eq 1 ]; then
+                usage "option is not valid in $MODE mode"
+            fi
+            if [ "$n" -eq 0 ] && [ "$PROMPT_MODE" != f ]; then
+                usage "missing operand"
+            fi
+            ;;
+        rmdir)
+            if [ "$RECURSIVE" -eq 1 ] || [ "$DIR_FLAG" -eq 1 ]; then
+                usage "recursive or -d conflicts with --rmdir"
+            fi
+            if [ "$PROMPT_MODE" = i ] || [ "$PROMPT_MODE" = I ]; then
+                usage "interactive flags conflict with --rmdir"
+            fi
+            if [ "$n" -eq 0 ]; then
+                usage "missing operand"
+            fi
+            ;;
+        list)
+            if [ "$n" -gt 1 ]; then
+                usage "surplus operands"
+            fi
+            ;;
+        info|delete)
+            if [ "$n" -ne 1 ]; then
+                usage "$MODE requires exactly one id"
+            fi
+            ;;
+        restore)
+            if [ "$n" -gt 1 ]; then
+                usage "surplus operands"
+            fi
+            ;;
+        empty|purge|stats|doctor)
+            if [ "$n" -ne 0 ]; then
+                usage "surplus operands"
+            fi
+            ;;
+    esac
+    if [ "$DOCTOR_REPAIR" -eq 1 ] && [ "$MODE" != doctor ]; then
+        usage "--repair is only valid with --doctor"
+    fi
+    if [ -n "$RESTORE_TO" ] || [ "$RESTORE_CREATE_PARENTS" -eq 1 ] || [ "$RESTORE_RENAME" -eq 1 ] || [ "$RESTORE_OVERWRITE" -eq 1 ] || [ "$IGNORE_CHECKSUM" -eq 1 ]; then
+        if [ "$MODE" != restore ]; then
+            usage "restore option used outside --restore"
+        fi
+    fi
+    if [ -n "$OLDER_THAN_ARG" ] || [ -n "$MAX_SIZE_ARG" ]; then
+        if [ "$MODE" != purge ]; then
+            usage "purge option used outside --purge"
+        fi
+    fi
+    if [ "$LONG_LIST" -eq 1 ] || [ "$OLDEST_FIRST" -eq 1 ] || [ "$LIST_QUARANTINE" -eq 1 ]; then
+        if [ "$MODE" != list ]; then
+            usage "list option used outside --list"
+        fi
+    fi
+    if [ "$PARENTS" -eq 1 ] || [ "$IGNORE_NONEMPTY" -eq 1 ]; then
+        if [ "$MODE" != rmdir ]; then
+            usage "rmdir option used outside --rmdir"
+        fi
+    fi
+    case "$MODE" in
+        list|info|stats|doctor) ;;
+        *)
+            if [ "$JSON_FLAG" -eq 1 ]; then
+                JSON_FLAG=0
+                usage "--json is only valid for --list, --info, --stats, and --doctor"
+            fi
+            ;;
+    esac
+}
+
+config_file_default() {
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s/safe-rm/config' "$XDG_CONFIG_HOME"
+    else
+        printf '%s/.config/safe-rm/config' "$USER_HOME"
+    fi
+}
+
+default_trash_base() {
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        printf '%s/Trash' "$XDG_DATA_HOME"
+    else
+        printf '%s/.local/share/Trash' "$USER_HOME"
+    fi
+}
+
+check_config_file_perms() {
+    local file="$1" uid mode
+    [ -e "$file" ] || return 0
+    if [ -L "$file" ]; then
+        die "$EC_USAGE" "refusing symlink config file: $file"
+    fi
+    uid=$(stat_uid "$file") || die "$EC_USAGE" "cannot stat config file"
+    if [ "$uid" != "$USER_UID" ]; then
+        die "$EC_USAGE" "config file must be owned by the invoking user"
+    fi
+    mode=$(stat_mode_octal "$file") || die "$EC_USAGE" "cannot read config mode"
+    mode=$((8#$mode))
+    if [ $((mode & 022)) -ne 0 ]; then
+        die "$EC_USAGE" "config file must not be group or world writable"
+    fi
+}
+
+apply_config_pair() {
+    local key="$1" val="$2"
+    case "$key" in
+        TRASH_BASE)
+            if [ "$ENV_SET_TRASH_BASE" -eq 0 ]; then TRASH_BASE_VALUE=$val; fi
+            ;;
+        TRASH_MAX_DAYS)
+            if [ "$ENV_SET_TRASH_MAX_DAYS" -eq 0 ]; then TRASH_MAX_DAYS_VALUE=$val; fi
+            ;;
+        TRASH_MAX_SIZE)
+            if [ "$ENV_SET_TRASH_MAX_SIZE" -eq 0 ]; then TRASH_MAX_SIZE_VALUE=$val; fi
+            ;;
+        TRASH_CHECKSUM)
+            if [ "$ENV_SET_TRASH_CHECKSUM" -eq 0 ]; then TRASH_CHECKSUM_VALUE=$val; fi
+            ;;
+        TRASH_CHECKSUM_MAX_SIZE)
+            if [ "$ENV_SET_TRASH_CHECKSUM_MAX" -eq 0 ]; then TRASH_CHECKSUM_MAX_VALUE=$val; fi
+            ;;
+        TRASH_AUTO_PURGE)
+            if [ "$ENV_SET_TRASH_AUTO_PURGE" -eq 0 ]; then TRASH_AUTO_PURGE_VALUE=$val; fi
+            ;;
+        TRASH_AUTO_PURGE_INTERVAL)
+            if [ "$ENV_SET_TRASH_AUTO_PURGE_INTERVAL" -eq 0 ]; then TRASH_AUTO_PURGE_INTERVAL_VALUE=$val; fi
+            ;;
+        TRASH_LOG_MAX_SIZE)
+            if [ "$ENV_SET_TRASH_LOG_MAX" -eq 0 ]; then TRASH_LOG_MAX_VALUE=$val; fi
+            ;;
+        TRASH_LOG_ROTATIONS)
+            if [ "$ENV_SET_TRASH_LOG_ROTATIONS" -eq 0 ]; then TRASH_LOG_ROTATIONS_VALUE=$val; fi
+            ;;
+        TRASH_LOCK_TIMEOUT)
+            if [ "$ENV_SET_TRASH_LOCK_TIMEOUT" -eq 0 ]; then TRASH_LOCK_TIMEOUT_VALUE=$val; fi
+            ;;
+        TRASH_INTERACTIVE)
+            if [ "$ENV_SET_TRASH_INTERACTIVE" -eq 0 ]; then TRASH_INTERACTIVE_VALUE=$val; fi
+            ;;
+        TRASH_PROTECT_PATHS)
+            if [ "$ENV_SET_TRASH_PROTECT" -eq 0 ]; then TRASH_PROTECT_VALUE=$val; fi
+            ;;
+        *)
+            die "$EC_USAGE" "unknown config key: $key"
+            ;;
+    esac
+}
+
+load_config_file() {
+    local file="$1" line lineno=0 raw key val seen="|"
+    [ -f "$file" ] || return 0
+    check_config_file_perms "$file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        case "$line" in
+            ''|\#*) continue ;;
+            *\#*) die "$EC_USAGE" "$file:$lineno: inline comments are not supported" ;;
+        esac
+        raw=$(trim_ascii "$line")
+        [ -n "$raw" ] || continue
+        case "$raw" in
+            *=*) ;;
+            *) die "$EC_USAGE" "$file:$lineno: expected KEY=value" ;;
+        esac
+        key=$(trim_ascii "${raw%%=*}")
+        val=$(trim_ascii "${raw#*=}")
+        val=$(strip_matching_quotes "$val")
+        case "$seen" in
+            *"|$key|"*) die "$EC_USAGE" "$file:$lineno: duplicate key $key" ;;
+        esac
+        seen="${seen}${key}|"
+        apply_config_pair "$key" "$val"
+    done <"$file"
+}
+
+apply_env_overrides() {
+    if [ "$ENV_SET_TRASH_BASE" -eq 1 ]; then TRASH_BASE_VALUE=$TRASH_BASE; fi
+    if [ "$ENV_SET_TRASH_MAX_DAYS" -eq 1 ]; then TRASH_MAX_DAYS_VALUE=$TRASH_MAX_DAYS; fi
+    if [ "$ENV_SET_TRASH_MAX_SIZE" -eq 1 ]; then TRASH_MAX_SIZE_VALUE=$TRASH_MAX_SIZE; fi
+    if [ "$ENV_SET_TRASH_CHECKSUM" -eq 1 ]; then TRASH_CHECKSUM_VALUE=$TRASH_CHECKSUM; fi
+    if [ "$ENV_SET_TRASH_CHECKSUM_MAX" -eq 1 ]; then TRASH_CHECKSUM_MAX_VALUE=$TRASH_CHECKSUM_MAX_SIZE; fi
+    if [ "$ENV_SET_TRASH_AUTO_PURGE" -eq 1 ]; then TRASH_AUTO_PURGE_VALUE=$TRASH_AUTO_PURGE; fi
+    if [ "$ENV_SET_TRASH_AUTO_PURGE_INTERVAL" -eq 1 ]; then TRASH_AUTO_PURGE_INTERVAL_VALUE=$TRASH_AUTO_PURGE_INTERVAL; fi
+    if [ "$ENV_SET_TRASH_LOG_MAX" -eq 1 ]; then TRASH_LOG_MAX_VALUE=$TRASH_LOG_MAX_SIZE; fi
+    if [ "$ENV_SET_TRASH_LOG_ROTATIONS" -eq 1 ]; then TRASH_LOG_ROTATIONS_VALUE=$TRASH_LOG_ROTATIONS; fi
+    if [ "$ENV_SET_TRASH_LOCK_TIMEOUT" -eq 1 ]; then TRASH_LOCK_TIMEOUT_VALUE=$TRASH_LOCK_TIMEOUT; fi
+    if [ "$ENV_SET_TRASH_INTERACTIVE" -eq 1 ]; then TRASH_INTERACTIVE_VALUE=$TRASH_INTERACTIVE; fi
+    if [ "$ENV_SET_TRASH_PROTECT" -eq 1 ]; then TRASH_PROTECT_VALUE=$TRASH_PROTECT_PATHS; fi
+}
+
+validate_settings() {
+    local tmp
+    case "$TRASH_CHECKSUM_VALUE" in
+        never|files|auto|always) ;;
+        *) die "$EC_USAGE" "invalid TRASH_CHECKSUM" ;;
+    esac
+    case "$TRASH_AUTO_PURGE_VALUE" in
+        true|false) ;;
+        *) die "$EC_USAGE" "TRASH_AUTO_PURGE must be true or false" ;;
+    esac
+    case "$TRASH_INTERACTIVE_VALUE" in
+        default|always|once|never) ;;
+        *) die "$EC_USAGE" "invalid TRASH_INTERACTIVE" ;;
+    esac
+    if [ "$TRASH_MAX_DAYS_VALUE" != off ]; then
+        is_uint "$TRASH_MAX_DAYS_VALUE" || die "$EC_USAGE" "invalid TRASH_MAX_DAYS"
+    fi
+    if [ "$TRASH_MAX_SIZE_VALUE" != off ]; then
+        tmp=$(parse_size "$TRASH_MAX_SIZE_VALUE") || die "$EC_USAGE" "invalid TRASH_MAX_SIZE"
+        TRASH_MAX_SIZE_VALUE=$tmp
+    fi
+    tmp=$(parse_size "$TRASH_CHECKSUM_MAX_VALUE") || die "$EC_USAGE" "invalid TRASH_CHECKSUM_MAX_SIZE"
+    TRASH_CHECKSUM_MAX_VALUE=$tmp
+    if [ "$TRASH_LOG_MAX_VALUE" = off ]; then
+        die "$EC_USAGE" "TRASH_LOG_MAX_SIZE must be a positive size"
+    fi
+    tmp=$(parse_size "$TRASH_LOG_MAX_VALUE") || die "$EC_USAGE" "invalid TRASH_LOG_MAX_SIZE"
+    if [ "$tmp" -le 0 ]; then
+        die "$EC_USAGE" "TRASH_LOG_MAX_SIZE must be positive"
+    fi
+    TRASH_LOG_MAX_VALUE=$tmp
+    is_uint "$TRASH_LOG_ROTATIONS_VALUE" || die "$EC_USAGE" "invalid TRASH_LOG_ROTATIONS"
+    if [ "$TRASH_LOG_ROTATIONS_VALUE" -gt 100 ]; then
+        die "$EC_USAGE" "TRASH_LOG_ROTATIONS must be 0 through 100"
+    fi
+    is_uint "$TRASH_LOCK_TIMEOUT_VALUE" || die "$EC_USAGE" "invalid TRASH_LOCK_TIMEOUT"
+    is_uint "$TRASH_AUTO_PURGE_INTERVAL_VALUE" || die "$EC_USAGE" "invalid TRASH_AUTO_PURGE_INTERVAL"
+    if [ -z "$TRASH_BASE_VALUE" ]; then
+        TRASH_BASE_VALUE=$(default_trash_base)
+    fi
+    case "$TRASH_BASE_VALUE" in
+        /*) ;;
+        *) die "$EC_USAGE" "TRASH_BASE must be absolute" ;;
+    esac
+    if [ -n "$OLDER_THAN_ARG" ]; then
+        tmp=$(parse_age "$OLDER_THAN_ARG") || die "$EC_USAGE" "invalid --older-than (use integer d or h)"
+        OLDER_THAN_ARG=$tmp
+    fi
+    if [ -n "$MAX_SIZE_ARG" ]; then
+        if [ "$MAX_SIZE_ARG" = off ]; then
+            :
+        else
+            tmp=$(parse_size "$MAX_SIZE_ARG") || die "$EC_USAGE" "invalid --max-size"
+            MAX_SIZE_ARG=$tmp
+        fi
+    fi
+}
+
+load_configuration() {
+    local file
+    if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+        file=$CONFIG_PATH
+        if [ ! -f "$file" ]; then
+            die "$EC_USAGE" "config file not found: $file"
+        fi
+    else
+        file=$(config_file_default)
+    fi
+    if [ -f "$file" ]; then
+        load_config_file "$file"
+    fi
+    apply_env_overrides
+    validate_settings
+}
+
+effective_prompt() {
+    if [ -n "$PROMPT_MODE" ]; then
+        printf '%s' "$PROMPT_MODE"
+        return 0
+    fi
+    case "$TRASH_INTERACTIVE_VALUE" in
+        always) printf 'i' ;;
+        once) printf 'I' ;;
+        never) printf 'n' ;;
+        *) printf 'd' ;;
+    esac
+}
+
+path_parent() {
+    local p="$1"
+    if [ "$p" = / ]; then
+        printf '/'
+        return 0
+    fi
+    case "$p" in
+        /*) ;;
+        *)
+            printf '%s' "${p%/*}"
+            return 0
+            ;;
+    esac
+    local parent=${p%/*}
+    if [ -z "$parent" ]; then
+        printf '/'
+    else
+        printf '%s' "$parent"
+    fi
+}
+
+path_final() {
+    local p="$1"
+    if [ "$p" = / ]; then
+        printf '/'
+        return 0
+    fi
+    printf '%s' "${p##*/}"
+}
+
+# shellcheck disable=SC2329
+strip_one_trailing_slash_class() {
+    local p="$1" had=0
+    while true; do
+        case "$p" in
+            */)
+                had=1
+                p=${p%/}
+                ;;
+            *) break ;;
+        esac
+    done
+    if [ -z "$p" ]; then
+        p=/
+    fi
+    printf '%s\n%s' "$had" "$p"
+}
+
+ends_with_slash() {
+    case "$1" in
+        */) return 0 ;;
+    esac
+    return 1
+}
+
+is_dot_component() {
+    case "$1" in
+        .|..) return 0 ;;
+    esac
+    return 1
+}
+
+phys_dir() {
+    CDPATH='' cd -P -- "$1" && pwd -P
+}
+
+normalize_operand() {
+    local input="$1" had_slash=0 work final parent phys
+    NORM_PATH=""
+    if [ -z "$input" ]; then
+        say_err "empty path"
+        return "$EC_USAGE"
+    fi
+    work=$input
+    if ends_with_slash "$work" && [ "$work" != / ]; then
+        had_slash=1
+        while ends_with_slash "$work"; do
+            work=${work%/}
+        done
+        if [ -z "$work" ]; then
+            work=/
+        fi
+    fi
+    final=$(path_final "$work")
+    if is_dot_component "$final"; then
+        say_err "refusing terminal component $final"
+        return "$EC_SAFETY"
+    fi
+    case "$work" in
+        /*) ;;
+        *) work="${CWD_PHYS}/${work}" ;;
+    esac
+    final=$(path_final "$work")
+    if is_dot_component "$final"; then
+        say_err "refusing terminal component $final"
+        return "$EC_SAFETY"
+    fi
+    parent=$(path_parent "$work")
+    if [ ! -d "$parent" ]; then
+        say_err "parent directory does not exist: $parent"
+        return "$EC_FAIL"
+    fi
+    phys=$(phys_dir "$parent") || {
+        say_err "cannot resolve parent: $parent"
+        return "$EC_FAIL"
+    }
+    if [ "$phys" = / ]; then
+        if [ -z "$final" ] || [ "$final" = / ]; then
+            NORM_PATH=/
+        else
+            NORM_PATH="/${final}"
+        fi
+    else
+        NORM_PATH="${phys}/${final}"
+    fi
+    if [ "$had_slash" -eq 1 ] && [ -L "$NORM_PATH" ]; then
+        say_err "refusing trailing slash on symbolic link: $input"
+        return "$EC_SAFETY"
+    fi
+    if [ ! -e "$NORM_PATH" ] && [ ! -L "$NORM_PATH" ]; then
+        return 10
+    fi
+    return 0
+}
+
+is_prefix_path() {
+    local ancestor="$1" child="$2"
+    if [ "$ancestor" = / ]; then
+        return 0
+    fi
+    if [ "$child" = "$ancestor" ]; then
+        return 0
+    fi
+    case "$child" in
+        "$ancestor"/*) return 0 ;;
+    esac
+    return 1
+}
+
+is_strict_ancestor() {
+    local ancestor="$1" child="$2"
+    if [ "$ancestor" = "$child" ]; then
+        return 1
+    fi
+    is_prefix_path "$ancestor" "$child"
+}
+
+mount_root_path() {
+    local p="$1" parent dev pdev
+    if [ "$p" = / ]; then
+        return 0
+    fi
+    parent=$(path_parent "$p")
+    dev=$(stat_device "$p") || return 1
+    pdev=$(stat_device "$parent") || return 1
+    [ "$dev" != "$pdev" ]
+}
+
+protected_reason() {
+    local p="$1" item decoded
+    if [ "$p" = / ]; then
+        printf 'filesystem root'
+        return 0
+    fi
+    if [ -n "$USER_HOME" ] && [ "$p" = "$USER_HOME" ]; then
+        printf 'home directory'
+        return 0
+    fi
+    if [ "$p" = "$CWD_PHYS" ]; then
+        printf 'current working directory'
+        return 0
+    fi
+    if is_strict_ancestor "$p" "$CWD_PHYS"; then
+        printf 'ancestor of the current working directory'
+        return 0
+    fi
+    if [ -n "$STORE_PATH" ]; then
+        if [ "$p" = "$STORE_PATH" ] || is_prefix_path "$STORE_PATH" "$p"; then
+            printf 'trash store'
+            return 0
+        fi
+        if is_strict_ancestor "$p" "$STORE_PATH"; then
+            printf 'ancestor of the trash store'
+            return 0
+        fi
+    fi
+    if mount_root_path "$p"; then
+        printf 'filesystem mount root'
+        return 0
+    fi
+    if [ -n "$TRASH_PROTECT_VALUE" ]; then
+        local rest="$TRASH_PROTECT_VALUE"
+        while [ -n "$rest" ]; do
+            item=${rest%%,*}
+            case "$rest" in
+                *,*) rest=${rest#*,} ;;
+                *) rest="" ;;
+            esac
+            percent_decode_var "$item" || {
+                printf 'invalid TRASH_PROTECT_PATHS entry'
+                return 0
+            }
+            decoded=$DECODED
+            case "$decoded" in
+                /*) ;;
+                *)
+                    printf 'invalid protected path'
+                    return 0
+                    ;;
+            esac
+            if [ "$p" = "$decoded" ] || is_prefix_path "$decoded" "$p"; then
+                printf 'configured protected path'
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+assert_path_allowed() {
+    local p="$1" why
+    if why=$(protected_reason "$p"); then
+        say_err "refusing protected path ($why): $p"
+        return "$EC_SAFETY"
+    fi
+    return 0
+}
+
+tree_crosses_mount() {
+    local root="$1" dev found=1
+    dev=$(stat_device "$root") || return 0
+    while IFS= read -r -d '' p; do
+        if [ -L "$p" ]; then
+            continue
+        fi
+        if [ "$(stat_device "$p")" != "$dev" ]; then
+            found=0
+            break
+        fi
+    done < <(find -P "$root" -print0 2>/dev/null)
+    return "$found"
+}
+
+tree_has_unsupported() {
+    local root="$1" found=1 letter
+    while IFS= read -r -d '' p; do
+        if [ -L "$p" ]; then
+            continue
+        fi
+        letter=$(stat_type_letter "$p")
+        case "$letter" in
+            f|d) ;;
+            *)
+                found=0
+                break
+                ;;
+        esac
+    done < <(find -P "$root" -print0 2>/dev/null)
+    return "$found"
+}
+
+dir_is_empty() {
+    local d="$1"
+    if [ ! -d "$d" ] || [ -L "$d" ]; then
+        return 1
+    fi
+    while IFS= read -r -d '' _; do
+        return 1
+    done < <(find -P "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    return 0
+}
+
+mode_private_ok() {
+    local path="$1" allow_sticky_root="$2" uid mode sticky
+    uid=$(stat_uid "$path") || return 1
+    mode=$(stat_mode_octal "$path") || return 1
+    mode=$((8#$mode))
+    sticky=0
+    if [ $((mode & 512)) -ne 0 ]; then
+        sticky=1
+    fi
+    if [ $((mode & 022)) -ne 0 ]; then
+        if [ "$allow_sticky_root" -eq 1 ] && [ "$sticky" -eq 1 ] && [ "$uid" -eq 0 ]; then
+            return 0
+        fi
+        return 1
+    fi
+    if [ "$uid" != "$USER_UID" ] && [ "$uid" != 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+canonicalize_store_path() {
+    local raw="$1" existing="" rest="" walk part phys
+    case "$raw" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    walk=$raw
+    while [ ! -d "$walk" ]; do
+        if [ "$walk" = / ]; then
+            return 1
+        fi
+        part=$(path_final "$walk")
+        if [ -z "$rest" ]; then
+            rest=$part
+        else
+            rest="${part}/${rest}"
+        fi
+        walk=$(path_parent "$walk")
+    done
+    existing=$walk
+    if [ -L "$existing" ]; then
+        phys=$(phys_dir "$existing") || return 1
+    else
+        phys=$(phys_dir "$existing") || return 1
+    fi
+    if [ -n "$rest" ]; then
+        if [ "$phys" = / ]; then
+            printf '/%s' "$rest"
+        else
+            printf '%s/%s' "$phys" "$rest"
+        fi
+    else
+        printf '%s' "$phys"
+    fi
+}
+
+store_component_is_symlink() {
+    local p="$1" walk="/" part
+    case "$p" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    local rest=${p#/}
+    while [ -n "$rest" ]; do
+        part=${rest%%/*}
+        case "$rest" in
+            */*) rest=${rest#*/} ;;
+            *) rest="" ;;
+        esac
+        if [ "$walk" = / ]; then
+            walk="/${part}"
+        else
+            walk="${walk}/${part}"
+        fi
+        if [ -L "$walk" ]; then
+            return 0
+        fi
+        if [ ! -e "$walk" ]; then
+            return 1
+        fi
+    done
+    return 1
+}
+
+check_store_ancestors() {
+    local p="$1" walk
+    walk=$p
+    while [ "$walk" != / ]; do
+        if [ -e "$walk" ] && [ ! -L "$walk" ]; then
+            if [ "$walk" = "$p" ]; then
+                mode_private_ok "$walk" 0 || return 1
+                local uid
+                uid=$(stat_uid "$walk") || return 1
+                [ "$uid" = "$USER_UID" ] || return 1
+            else
+                mode_private_ok "$walk" 1 || return 1
+            fi
+        fi
+        walk=$(path_parent "$walk")
+    done
+    return 0
+}
+# --- store, transactions, and commands ---
+
+prepare_store_path() {
+    local canon
+    canon=$(canonicalize_store_path "$TRASH_BASE_VALUE") || die "$EC_SAFETY" "TRASH_BASE cannot be resolved: $TRASH_BASE_VALUE"
+    if [ "$canon" = / ] || { [ -n "$USER_HOME" ] && [ "$canon" = "$USER_HOME" ]; }; then
+        die "$EC_SAFETY" "refusing trash store at a protected location"
+    fi
+    if store_component_is_symlink "$canon"; then
+        die "$EC_SAFETY" "refusing trash store path that still contains a symlink: $canon"
+    fi
+    STORE_PATH=$canon
+    if [ -e "$STORE_PATH" ]; then
+        check_store_ancestors "$STORE_PATH" || die "$EC_SAFETY" "trash store ancestors are not private enough: $STORE_PATH"
+    fi
+}
+
+store_marker_ok() {
+    local marker="$STORE_PATH/.safe-rm-store" ver sid uid
+    [ -f "$marker" ] || return 1
+    [ -L "$marker" ] && return 1
+    ver=$(awk -F= '$1=="FormatVersion"{print substr($0,index($0,"=")+1); exit}' "$marker") || return 1
+    sid=$(awk -F= '$1=="StoreID"{print substr($0,index($0,"=")+1); exit}' "$marker") || return 1
+    uid=$(awk -F= '$1=="OwnerUID"{print substr($0,index($0,"=")+1); exit}' "$marker") || return 1
+    [ "$ver" = "$META_VERSION" ] || return 1
+    valid_id "$sid" || return 1
+    [ "$uid" = "$USER_UID" ] || return 1
+    local owner
+    owner=$(stat_uid "$marker") || return 1
+    [ "$owner" = "$USER_UID" ] || return 1
+    STORE_ID=$sid
+    return 0
+}
+
+store_is_empty_dir() {
+    dir_is_empty "$1"
+}
+
+init_store() {
+    local marker sub
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    if [ ! -e "$STORE_PATH" ]; then
+        mkdir -p -- "$STORE_PATH" || die "$EC_FAIL" "cannot create trash store: $STORE_PATH"
+    fi
+    if [ -L "$STORE_PATH" ] || [ ! -d "$STORE_PATH" ]; then
+        die "$EC_SAFETY" "trash store path is not a real directory: $STORE_PATH"
+    fi
+    check_store_ancestors "$STORE_PATH" || die "$EC_SAFETY" "trash store is not private: $STORE_PATH"
+    if [ -e "$STORE_PATH/.safe-rm-store" ]; then
+        store_marker_ok || die "$EC_INTEGRITY" "trash store marker is invalid or not owned by this user"
+    else
+        if ! store_is_empty_dir "$STORE_PATH"; then
+            die "$EC_SAFETY" "refusing unmarked populated directory $STORE_PATH; set TRASH_BASE to a new private path"
+        fi
+        STORE_ID=$(gen_id) || die "$EC_CAPABILITY" "could not generate a store id"
+        marker="$STORE_PATH/.safe-rm-store"
+        printf 'FormatVersion=%s\nStoreID=%s\nOwnerUID=%s\n' "$META_VERSION" "$STORE_ID" "$USER_UID" >"$marker" || die "$EC_FAIL" "cannot write store marker"
+        chmod 600 "$marker" || die "$EC_FAIL" "cannot protect store marker"
+    fi
+    for sub in files info tmp quarantine log; do
+        if [ -e "$STORE_PATH/$sub" ]; then
+            if [ -L "$STORE_PATH/$sub" ] || [ ! -d "$STORE_PATH/$sub" ]; then
+                die "$EC_INTEGRITY" "store component is not a private directory: $sub"
+            fi
+        else
+            mkdir -m 700 -- "$STORE_PATH/$sub" || die "$EC_FAIL" "cannot create store component: $sub"
+        fi
+    done
+    store_marker_ok || die "$EC_INTEGRITY" "store marker failed revalidation"
+    STORE_READY=1
+}
+
+# shellcheck disable=SC2329
+lock_meta_pid() {
+    awk -F= '$1=="PID"{print substr($0,index($0,"=")+1); exit}' "$1" 2>/dev/null || true
+}
+
+lock_meta_field() {
+    awk -F= -v k="$2" '$1==k{print substr($0,index($0,"=")+1); exit}' "$1" 2>/dev/null || true
+}
+
+pid_is_dead() {
+    local pid="$1" err
+    err=$(kill -0 "$pid" 2>&1) && return 1
+    case "$err" in
+        *"No such process"*) return 0 ;;
+    esac
+    return 1
+}
+
+try_recover_stale_lock() {
+    local meta pid host token guard
+    meta="$STORE_PATH/.lock/meta"
+    [ -d "$STORE_PATH/.lock" ] || return 1
+    [ -f "$meta" ] || return 1
+    [ -L "$meta" ] && return 1
+    pid=$(lock_meta_field "$meta" PID)
+    host=$(lock_meta_field "$meta" Host)
+    token=$(lock_meta_field "$meta" Token)
+    is_uint "$pid" || return 1
+    [ "$host" = "$HOST_NAME" ] || return 1
+    pid_is_dead "$pid" || return 1
+    guard="$STORE_PATH/.lock-recover"
+    mkdir "$guard" 2>/dev/null || return 1
+    pid2=$(lock_meta_field "$meta" PID)
+    token2=$(lock_meta_field "$meta" Token)
+    if [ "$pid2" != "$pid" ] || [ "$token2" != "$token" ] || ! pid_is_dead "$pid"; then
+        rmdir "$guard" 2>/dev/null || true
+        return 1
+    fi
+    if [ -n "$SYS_RM" ]; then
+        "$SYS_RM" -f -- "$meta" || true
+    fi
+    rmdir "$STORE_PATH/.lock" 2>/dev/null || true
+    rmdir "$guard" 2>/dev/null || true
+    if [ -d "$STORE_PATH/.lock" ]; then
+        return 1
+    fi
+    log_event LOCK_RECOVERY "$token" "-" "-" "-" "recovered stale lock pid=$pid" || true
+    return 0
+}
+
+acquire_lock() {
+    local op="$1" start now meta token
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        return 0
+    fi
+    ensure_tools
+    init_store
+    start=$(epoch_now)
+    while true; do
+        if mkdir "$STORE_PATH/.lock" 2>/dev/null; then
+            token=$(gen_hex 16) || die "$EC_CAPABILITY" "could not generate a lock token"
+            meta="$STORE_PATH/.lock/meta"
+            printf 'FormatVersion=1\nPID=%s\nHost=%s\nEpoch=%s\nStartIdentity=%s\nOperation=%s\nToken=%s\n' \
+                "$$" "$HOST_NAME" "$(epoch_now)" "$(ps -p $$ -o lstart= 2>/dev/null || printf unknown)" \
+                "$op" "$token" >"$meta" || die "$EC_LOCK" "could not write lock metadata"
+            chmod 600 "$meta" || true
+            LOCK_TOKEN=$token
+            LOCK_HELD=1
+            return 0
+        fi
+        if try_recover_stale_lock; then
+            continue
+        fi
+        now=$(epoch_now)
+        if [ $((now - start)) -ge "$TRASH_LOCK_TIMEOUT_VALUE" ]; then
+            die "$EC_LOCK" "timed out waiting for store lock after ${TRASH_LOCK_TIMEOUT_VALUE}s"
+        fi
+        sleep 0.2
+    done
+}
+
+unresolved_journals() {
+    local d j state
+    [ -d "$STORE_PATH/tmp" ] || return 1
+    while IFS= read -r -d '' d; do
+        j="$d/journal"
+        if [ -f "$j" ]; then
+            state=$(awk -F= '$1=="State"{print substr($0,index($0,"=")+1); exit}' "$j")
+            if [ "$state" != COMMITTED ]; then
+                return 0
+            fi
+        else
+            return 0
+        fi
+    done < <(find "$STORE_PATH/tmp" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    return 1
+}
+
+refuse_if_unresolved() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ -d "$STORE_PATH" ] && unresolved_journals; then
+            say_err "dry-run: execution would stop because unresolved journals exist; run safe-rm --doctor --repair"
+            return "$EC_INTEGRITY"
+        fi
+        return 0
+    fi
+    if unresolved_journals; then
+        die "$EC_INTEGRITY" "unresolved journal exists; run safe-rm --doctor --repair before another change"
+    fi
+}
+
+kv_get() {
+    awk -F= -v k="$2" '$1==k {print substr($0,index($0,"=")+1); found=1; exit} END{ if (!found) exit 1 }' "$1"
+}
+
+atomic_write() {
+    local dest="$1" dir tmp
+    dir=$(dirname -- "$dest")
+    tmp="$dir/.partial.$$"
+    cat >"$tmp" || return 1
+    chmod 600 "$tmp" || true
+    "$SYS_MV" -- "$tmp" "$dest"
+}
+
+id_reserved() {
+    local id="$1" d j
+    { [ -e "$STORE_PATH/files/$id" ] || [ -L "$STORE_PATH/files/$id" ]; } && return 0
+    [ -e "$STORE_PATH/info/$id.trashinfo" ] && return 0
+    [ -e "$STORE_PATH/quarantine/$id" ] && return 0
+    if [ -d "$STORE_PATH/tmp" ]; then
+        while IFS= read -r -d '' d; do
+            if [ -f "$d/journal" ]; then
+                j=$(kv_get "$d/journal" EntryID 2>/dev/null || true)
+                [ "$j" = "$id" ] && return 0
+            fi
+        done < <(find "$STORE_PATH/tmp" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    fi
+    return 1
+}
+
+allocate_id() {
+    local i=0 id
+    while [ "$i" -lt 8 ]; do
+        id=$(gen_id) || return 1
+        if ! id_reserved "$id"; then
+            printf '%s' "$id"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+log_event() {
+    local action="$1" tx="$2" entry="$3" src="$4" dst="$5" msg="$6"
+    local logf size next gen line
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$STORE_READY" -eq 1 ] || return 0
+    logf="$STORE_PATH/log/trash.log"
+    if [ -L "$logf" ]; then
+        warn "log target is a symlink; not writing"
+        return 0
+    fi
+    percent_encode_var "$src"
+    src=$ENCODED
+    percent_encode_var "$dst"
+    dst=$ENCODED
+    percent_encode_var "$msg"
+    msg=$ENCODED
+    line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$LOG_VERSION" "$(epoch_now)" "$(utc_stamp)" "$action" "$tx" "$entry" "$src" "$dst" "ok" "$msg")
+    size=0
+    if [ -f "$logf" ]; then
+        size=$(stat_size "$logf" || printf 0)
+    fi
+    next=${#line}
+    if [ $((size + next)) -gt "$TRASH_LOG_MAX_VALUE" ]; then
+        gen=$TRASH_LOG_ROTATIONS_VALUE
+        if [ "$gen" -eq 0 ]; then
+            : >"$logf"
+        else
+            while [ "$gen" -gt 1 ]; do
+                if [ -f "$logf.$((gen - 1))" ]; then
+                    "$SYS_MV" -- "$logf.$((gen - 1))" "$logf.$gen" || true
+                fi
+                gen=$((gen - 1))
+            done
+            if [ -f "$logf" ]; then
+                "$SYS_MV" -- "$logf" "$logf.1" || true
+            fi
+        fi
+    fi
+    printf '%s' "$line" >>"$logf" || warn "could not append trash log"
+    return 0
+}
+
+logical_bytes_of() {
+    local p="$1" letter sum s child
+    letter=$(stat_type_letter "$p")
+    case "$letter" in
+        f) stat_size "$p" ;;
+        l)
+            readlink -- "$p" | wc -c | tr -d ' '
+            ;;
+        d)
+            sum=0
+            while IFS= read -r -d '' child; do
+                if [ -f "$child" ] && [ ! -L "$child" ]; then
+                    s=$(stat_size "$child") || s=0
+                    sum=$((sum + s))
+                fi
+            done < <(find -P "$p" -type f -print0 2>/dev/null)
+            printf '%s' "$sum"
+            ;;
+        *) printf '0' ;;
+    esac
+}
+
+allocated_bytes_of() {
+    local p="$1" blocks
+    if command -v du >/dev/null 2>&1; then
+        blocks=$(du -k -s "$p" 2>/dev/null | awk '{print $1; exit}') || true
+        if is_uint "${blocks:-}"; then
+            printf '%s' $((blocks * 1024))
+            return 0
+        fi
+    fi
+    blocks=$(stat_blocks "$p" 2>/dev/null || true)
+    if is_uint "${blocks:-}"; then
+        printf '%s' $((blocks * 512))
+        return 0
+    fi
+    printf 'unknown'
+}
+
+write_manifest_file() {
+    local root="$1" out="$2" rel letter mode size extra ino nlink target
+    : >"$out"
+    while IFS= read -r -d '' p; do
+        rel=${p#"$root"}
+        case "$rel" in
+            "") rel="." ;;
+            /*) rel=${rel#/} ;;
+        esac
+        letter=$(stat_type_letter "$p")
+        mode=$(stat_mode_octal "$p" 2>/dev/null || printf 0)
+        size=$(stat_size "$p" 2>/dev/null || printf 0)
+        ino=$(stat_inode "$p" 2>/dev/null || printf 0)
+        nlink=$(stat_nlink "$p" 2>/dev/null || printf 1)
+        extra="-"
+        case "$letter" in
+            f)
+                extra=$(sha256_file "$p") || return 1
+                ;;
+            l)
+                target=$(readlink -- "$p") || return 1
+                percent_encode_var "$target"
+                extra=$ENCODED
+                ;;
+        esac
+        percent_encode_var "$rel"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$letter" "$mode" "$size" "$extra" "$ino" "$nlink" "$ENCODED" >>"$out"
+    done < <(find -P "$root" -print0)
+    LC_ALL=C sort -o "$out" "$out"
+}
+
+manifest_without_inode() {
+    awk -F '\t' '{print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $7}' "$1" | LC_ALL=C sort
+}
+
+# shellcheck disable=SC2329
+hardlink_groups_ok() {
+    local src="$1" dst="$2"
+    awk -F '\t' '
+        FNR==NR { if ($1=="f" && $6+0>1) src[$7]=src[$7] "," $5; next }
+        { if ($1=="f" && $6+0>1) dst[$7]=dst[$7] "," $5 }
+        END {
+            for (p in src) {
+                split(src[p], a, ",")
+                split(dst[p], b, ",")
+                if (a[2] == "" || b[2] == "") continue
+            }
+        }
+    ' "$src" "$dst"
+    return 0
+}
+
+copy_payload() {
+    local src="$1" dest="$2" letter
+    letter=$(stat_type_letter "$src")
+    case "$letter" in
+        l) "$SYS_CP" -P -- "$src" "$dest" ;;
+        f) "$SYS_CP" -p -P -- "$src" "$dest" ;;
+        d)
+            if [ "$(uname -s)" = Darwin ] && command -v ditto >/dev/null 2>&1; then
+                ditto --noqtn "$src" "$dest"
+            else
+                "$SYS_CP" -R -p -P -- "$src" "$dest"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+remove_tree() {
+    local p="$1" letter
+    letter=$(stat_type_letter "$p")
+    case "$letter" in
+        d) "$SYS_RM" -R -- "$p" ;;
+        *) "$SYS_RM" -f -- "$p" ;;
+    esac
+}
+
+journal_path_for() {
+    printf '%s/tmp/%s/journal' "$STORE_PATH" "$1"
+}
+
+write_journal() {
+    local tx="$1" state="$2" entry="$3" action="$4" src="$5" dst="$6" dev="$7" ino="$8" staging="$9" payload="${10}" verify="${11}"
+    local es ed ev
+    percent_encode_var "$src"; es=$ENCODED
+    percent_encode_var "$dst"; ed=$ENCODED
+    percent_encode_var "$verify"; ev=$ENCODED
+    atomic_write "$(journal_path_for "$tx")" <<EOF
+FormatVersion=1
+TransactionID=$tx
+State=$state
+EntryID=$entry
+Action=$action
+SourcePath=$es
+DestPath=$ed
+SourceDevice=$dev
+SourceInode=$ino
+StagingPath=$staging
+PayloadPath=$payload
+Verification=$ev
+StoreID=$STORE_ID
+EOF
+}
+
+checksum_plan() {
+    local path="$1" letter size
+    letter=$(stat_type_letter "$path")
+    size=$(logical_bytes_of "$path")
+    CS_ALGO="none"
+    CS_VALUE="absent"
+    CS_REASON="policy-never"
+    case "$TRASH_CHECKSUM_VALUE" in
+        never)
+            return 0
+            ;;
+        files|auto|always)
+            if [ "$letter" = f ]; then
+                if [ "$TRASH_CHECKSUM_VALUE" = auto ] && [ "$size" -gt "$TRASH_CHECKSUM_MAX_VALUE" ]; then
+                    CS_REASON="over-auto-threshold"
+                    return 0
+                fi
+                require_hash
+                CS_ALGO="sha256"
+                CS_VALUE=$(sha256_file "$path") || return 1
+                CS_REASON="stored"
+                return 0
+            fi
+            if [ "$letter" = l ]; then
+                CS_REASON="symlink-target-bytes"
+                return 0
+            fi
+            if [ "$letter" = d ] && [ "$TRASH_CHECKSUM_VALUE" = always ]; then
+                require_hash
+                CS_ALGO="sha256"
+                CS_REASON="manifest"
+                return 0
+            fi
+            CS_REASON="not-a-regular-file"
+            ;;
+    esac
+    return 0
+}
+
+publish_metadata() {
+    local id="$1" tx="$2" src="$3" otype="$4" logical="$5" alloc="$6" uid="$7" gid="$8" mode="$9" dev="${10}" ino="${11}" verify="${12}" linktarget="${13}"
+    local enc orig enc_link enc_verify dest tmp
+    percent_encode_var "$src"; enc=$ENCODED
+    percent_encode_var "${ENTERED_PATH:-$src}"; orig=$ENCODED
+    percent_encode_var "$linktarget"; enc_link=$ENCODED
+    percent_encode_var "$verify"; enc_verify=$ENCODED
+    dest="$STORE_PATH/info/$id.trashinfo"
+    [ -e "$dest" ] && return 1
+    tmp="$STORE_PATH/info/.$id.partial"
+    {
+        printf 'FormatVersion=%s\n' "$META_VERSION"
+        printf 'ID=%s\n' "$id"
+        printf 'StoreID=%s\n' "$STORE_ID"
+        printf 'OriginalPath=%s\n' "$enc"
+        printf 'EnteredPath=%s\n' "$orig"
+        printf 'DeletedEpoch=%s\n' "$(epoch_now)"
+        printf 'DeletedUTC=%s\n' "$(utc_stamp)"
+        printf 'StoredName=%s\n' "$id"
+        printf 'ObjectType=%s\n' "$otype"
+        printf 'LogicalBytes=%s\n' "$logical"
+        printf 'AllocatedBytes=%s\n' "$alloc"
+        printf 'SizeMethod=%s\n' "lstat-size-and-du-k"
+        printf 'UID=%s\n' "$uid"
+        printf 'GID=%s\n' "$gid"
+        printf 'Mode=%s\n' "$mode"
+        printf 'SourceDevice=%s\n' "$dev"
+        printf 'SourceInode=%s\n' "$ino"
+        printf 'TransactionID=%s\n' "$tx"
+        printf 'ChecksumAlgorithm=%s\n' "$CS_ALGO"
+        printf 'Checksum=%s\n' "$CS_VALUE"
+        printf 'ChecksumReason=%s\n' "$CS_REASON"
+        printf 'Verification=%s\n' "$enc_verify"
+        printf 'ScriptVersion=%s\n' "$SAFE_RM_VERSION"
+        if [ -n "$linktarget" ]; then
+            printf 'SymlinkTarget=%s\n' "$enc_link"
+        fi
+        if [ -n "${MANIFEST_SHA:-}" ]; then
+            printf 'ManifestSHA256=%s\n' "$MANIFEST_SHA"
+        fi
+    } >"$tmp" || return 1
+    chmod 600 "$tmp" || return 1
+    "$SYS_MV" -n -- "$tmp" "$dest" 2>/dev/null || "$SYS_MV" -- "$tmp" "$dest" || return 1
+    kv_get "$dest" ID >/dev/null || return 1
+    return 0
+}
+
+quarantine_dir() {
+    local reason="$1" tx="$2" id="$3" src="$4" q
+    q=$(gen_id) || return 1
+    mkdir -m 700 -- "$STORE_PATH/quarantine/$q" || return 1
+    if [ -d "$STORE_PATH/tmp/$tx" ]; then
+        "$SYS_MV" -- "$STORE_PATH/tmp/$tx" "$STORE_PATH/quarantine/$q/transaction" || true
+    fi
+    if [ -e "$STORE_PATH/files/$id" ]; then
+        "$SYS_MV" -- "$STORE_PATH/files/$id" "$STORE_PATH/quarantine/$q/payload" || true
+    fi
+    if [ -f "$STORE_PATH/info/$id.trashinfo" ]; then
+        "$SYS_MV" -- "$STORE_PATH/info/$id.trashinfo" "$STORE_PATH/quarantine/$q/metadata" || true
+    fi
+    percent_encode_var "$src"
+    percent_encode_var "$reason"
+    printf 'FormatVersion=1\nIncidentID=%s\nReason=%s\nEntryID=%s\nTransactionID=%s\nSourcePath=%s\nGuidance=%s\n' \
+        "$q" "$ENCODED" "$id" "$tx" "$ENCODED" \
+        "Validate the preserved payload, copy it out with cp -P or ditto, and do not delete this directory from empty or purge." \
+        >"$STORE_PATH/quarantine/$q/incident" || return 1
+    LAST_INCIDENT=$q
+    warn "preserved data for recovery as incident ${LAST_INCIDENT}"
+    return 0
+}
+
+trash_one_resolved() {
+    local src="$1" letter otype dev ino uid gid mode logical alloc id tx staging payload verify same=0
+    ENTERED_PATH=${ENTERED_SAVE:-$src}
+    letter=$(stat_type_letter "$src")
+    case "$letter" in
+        f) otype="file" ;;
+        d) otype="directory" ;;
+        l) otype="symlink" ;;
+        *)
+            say_err "refusing special file: $src"
+            return "$EC_FAIL"
+            ;;
+    esac
+    if [ "$otype" = directory ] && [ "$RECURSIVE" -ne 1 ]; then
+        if [ "$DIR_FLAG" -eq 1 ]; then
+            if ! dir_is_empty "$src"; then
+                say_err "directory not empty: $src"
+                return "$EC_FAIL"
+            fi
+        else
+            say_err "refusing directory without -r: $src"
+            return "$EC_FAIL"
+        fi
+    fi
+    if [ "$otype" = directory ] && [ "$RECURSIVE" -eq 1 ]; then
+        if tree_crosses_mount "$src"; then
+            say_err "refusing directory that crosses a mount: $src"
+            return "$EC_SAFETY"
+        fi
+    fi
+    dev=$(stat_device "$src") || return "$EC_FAIL"
+    ino=$(stat_inode "$src") || return "$EC_FAIL"
+    uid=$(stat_uid "$src") || return "$EC_FAIL"
+    gid=$(stat_gid "$src") || return "$EC_FAIL"
+    mode=$(stat_mode_octal "$src") || return "$EC_FAIL"
+    logical=$(logical_bytes_of "$src") || logical=0
+    alloc=$(allocated_bytes_of "$src")
+    MANIFEST_SHA=""
+    checksum_plan "$src" || {
+        say_err "checksum could not be produced for $src"
+        return "$EC_FAIL"
+    }
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$QUIET" -eq 0 ]; then
+            printf 'DRY RUN: would trash %s\n' "$(display_escape "$src")"
+        fi
+        return 0
+    fi
+    local store_dev
+    store_dev=$(stat_device "$STORE_PATH") || return "$EC_FAIL"
+    if [ "$dev" = "$store_dev" ]; then
+        same=1
+    else
+        if [ "$otype" = directory ] && tree_has_unsupported "$src"; then
+            say_err "refusing cross-filesystem tree with unsupported special files: $src"
+            return "$EC_FAIL"
+        fi
+        require_hash
+    fi
+    id=$(allocate_id) || {
+        say_err "could not allocate an entry id"
+        return "$EC_INTEGRITY"
+    }
+    tx=$(gen_id) || return "$EC_CAPABILITY"
+    mkdir -m 700 -- "$STORE_PATH/tmp/$tx" || return "$EC_FAIL"
+    staging="$STORE_PATH/tmp/$tx/payload"
+    payload="$STORE_PATH/files/$id"
+    verify="same-device-rename"
+    [ "$same" -eq 0 ] && verify="cross-device-copy"
+    write_journal "$tx" PREPARED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || return "$EC_INTEGRITY"
+    inject_fail prepared
+    if [ "$same" -eq 1 ]; then
+        "$SYS_MV" -- "$src" "$staging" || {
+            say_err "could not stage $src"
+            "$SYS_RMDIR" -- "$STORE_PATH/tmp/$tx" 2>/dev/null || true
+            return "$EC_FAIL"
+        }
+        write_journal "$tx" SOURCE_REMOVED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+        inject_fail staged
+        if [ "$(stat_inode "$staging")" != "$ino" ] || [ "$(stat_device "$staging")" != "$dev" ]; then
+            say_err "staged identity changed for $src"
+            return "$EC_INTEGRITY"
+        fi
+        if [ "$CS_ALGO" = sha256 ] && [ "$otype" = file ]; then
+            local nowsum
+            nowsum=$(sha256_file "$staging") || {
+                say_err "checksum failed after stage for $src"
+                return "$EC_INTEGRITY"
+            }
+            if [ "$nowsum" != "$CS_VALUE" ]; then
+                say_err "checksum mismatch after stage for $src"
+                return "$EC_INTEGRITY"
+            fi
+        fi
+        if [ "$CS_REASON" = manifest ]; then
+            require_hash
+            write_manifest_file "$staging" "$STORE_PATH/info/$id.manifest" || return "$EC_INTEGRITY"
+            MANIFEST_SHA=$(sha256_file "$STORE_PATH/info/$id.manifest") || return "$EC_INTEGRITY"
+        fi
+        write_journal "$tx" VERIFIED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+        inject_fail verified
+        if [ -e "$payload" ]; then
+            say_err "payload destination already exists"
+            return "$EC_INTEGRITY"
+        fi
+        "$SYS_MV" -- "$staging" "$payload" || return "$EC_INTEGRITY"
+        inject_fail payload
+    else
+        local man1 man2
+        man1="$STORE_PATH/tmp/$tx/source.manifest"
+        man2="$STORE_PATH/tmp/$tx/dest.manifest"
+        write_manifest_file "$src" "$man1" || {
+            say_err "cannot inventory $src"
+            return "$EC_FAIL"
+        }
+        copy_payload "$src" "$staging" || {
+            say_err "copy failed for $src; source left in place"
+            remove_tree "$staging" 2>/dev/null || true
+            return "$EC_FAIL"
+        }
+        inject_fail copy
+        write_manifest_file "$staging" "$man2" || {
+            say_err "cannot inventory staged copy of $src"
+            return "$EC_INTEGRITY"
+        }
+        if ! cmp -s <(manifest_without_inode "$man1") <(manifest_without_inode "$man2"); then
+            say_err "staged copy does not match $src; source left in place"
+            remove_tree "$staging" 2>/dev/null || true
+            return "$EC_INTEGRITY"
+        fi
+        local man3="$STORE_PATH/tmp/$tx/source2.manifest"
+        write_manifest_file "$src" "$man3" || return "$EC_INTEGRITY"
+        if ! cmp -s "$man1" "$man3"; then
+            say_err "source changed during copy; source left in place: $src"
+            remove_tree "$staging" 2>/dev/null || true
+            return "$EC_INTEGRITY"
+        fi
+        if [ "$(stat_device "$src")" != "$dev" ] || [ "$(stat_inode "$src")" != "$ino" ]; then
+            say_err "source identity changed during copy: $src"
+            remove_tree "$staging" 2>/dev/null || true
+            return "$EC_INTEGRITY"
+        fi
+        verify="cross-device-sha256-verified"
+        if [ "$CS_REASON" = manifest ] || [ "$TRASH_CHECKSUM_VALUE" = always ]; then
+            "$SYS_CP" -p -- "$man2" "$STORE_PATH/info/$id.manifest" || return "$EC_INTEGRITY"
+            MANIFEST_SHA=$(sha256_file "$STORE_PATH/info/$id.manifest") || return "$EC_INTEGRITY"
+            CS_ALGO=sha256
+            CS_VALUE=$MANIFEST_SHA
+            CS_REASON=manifest
+        fi
+        write_journal "$tx" VERIFIED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+        "$SYS_MV" -- "$staging" "$payload" || return "$EC_INTEGRITY"
+        local linkt=""
+        if [ "$otype" = symlink ]; then
+            linkt=$(readlink -- "$payload") || true
+        fi
+        publish_metadata "$id" "$tx" "$src" "$otype" "$logical" "$alloc" "$uid" "$gid" "$mode" "$dev" "$ino" "$verify" "$linkt" || {
+            say_err "metadata publish failed after copy; source still in place"
+            return "$EC_INTEGRITY"
+        }
+        write_journal "$tx" STAGED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+        if [ "$(stat_device "$src")" != "$dev" ] || [ "$(stat_inode "$src")" != "$ino" ]; then
+            say_err "source identity changed before removal; recoverable copy kept as $id"
+            return "$EC_INTEGRITY"
+        fi
+        inject_fail source_remove
+        if ! remove_tree "$src"; then
+            say_err "source removal failed after a verified copy was stored as $id"
+            write_journal "$tx" SOURCE_REMOVED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "removal-incomplete" || true
+            return "$EC_INTEGRITY"
+        fi
+        if [ -e "$src" ] || [ -L "$src" ]; then
+            say_err "source still present after removal; recoverable copy kept as $id"
+            return "$EC_INTEGRITY"
+        fi
+        write_journal "$tx" COMMITTED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+        "$SYS_RM" -f -- "$STORE_PATH/tmp/$tx/journal" "$man1" "$man2" "$man3" 2>/dev/null || true
+        "$SYS_RMDIR" -- "$STORE_PATH/tmp/$tx" 2>/dev/null || true
+        log_event TRASH "$tx" "$id" "$src" "$payload" "trashed" || true
+        if [ "$VERBOSE" -eq 1 ]; then
+            printf 'trashed %s -> %s\n' "$(display_escape "$src")" "$id"
+        fi
+        LAST_ID=$id
+        return 0
+    fi
+    local linkt=""
+    if [ "$otype" = symlink ]; then
+        linkt=$(readlink -- "$payload") || true
+    fi
+    publish_metadata "$id" "$tx" "$src" "$otype" "$logical" "$alloc" "$uid" "$gid" "$mode" "$dev" "$ino" "$verify" "$linkt" || {
+        if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+            "$SYS_MV" -- "$payload" "$src" 2>/dev/null || quarantine_dir "metadata failure" "$tx" "$id" "$src" || true
+        fi
+        say_err "metadata publish failed for $src"
+        return "$EC_INTEGRITY"
+    }
+    inject_fail metadata
+    write_journal "$tx" COMMITTED "$id" trash "$src" "$payload" "$dev" "$ino" "$staging" "$payload" "$verify" || true
+    "$SYS_RM" -f -- "$STORE_PATH/tmp/$tx/journal" 2>/dev/null || true
+    "$SYS_RMDIR" -- "$STORE_PATH/tmp/$tx" 2>/dev/null || true
+    log_event TRASH "$tx" "$id" "$src" "$payload" "trashed" || true
+    if [ "$VERBOSE" -eq 1 ]; then
+        printf 'trashed %s -> %s\n' "$(display_escape "$src")" "$id"
+    fi
+    LAST_ID=$id
+    return 0
+}
+
+maybe_prompt_operand() {
+    local src="$1" mode
+    mode=$(effective_prompt)
+    case "$mode" in
+        f|n) return 0 ;;
+        i)
+            prompt_line "remove $(display_escape "$src")? " || return 1
+            ;;
+        d)
+            if [ -f "$src" ] && [ ! -L "$src" ] && [ ! -w "$src" ] && have_tty; then
+                prompt_line "remove write-protected file $(display_escape "$src")? " || return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+record_ok() {
+    OK_COUNT=$((OK_COUNT + 1))
+    OK_PATHS+=("$1")
+}
+
+record_fail() {
+    local code="$1" path="$2"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    FAIL_PATHS+=("$path")
+    note_status "$code"
+}
+
+cmd_trash() {
+    local op rc norm letter prompt
+    if [ "${#OPERANDS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    prompt=$(effective_prompt)
+    if [ "$prompt" = I ]; then
+        local many=0 count=0
+        count=${#OPERANDS[@]}
+        if [ "$count" -gt 3 ] || [ "$RECURSIVE" -eq 1 ]; then
+            many=1
+        fi
+        if [ "$many" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+            if ! prompt_line "remove ${count} operand(s)? "; then
+                if [ "$QUIET" -eq 0 ]; then
+                    printf 'cancelled\n'
+                fi
+                return 0
+            fi
+        fi
+    fi
+    local need=0 pre prc=1
+    for pre in "${OPERANDS[@]}"; do
+        normalize_operand "$pre" 2>/dev/null
+        prc=$?
+        if [ "$prc" -eq 0 ]; then
+            if ! protected_reason "$NORM_PATH" >/dev/null; then
+                need=1
+                break
+            fi
+        fi
+    done
+    if [ "$need" -eq 1 ]; then
+        acquire_lock trash
+        refuse_if_unresolved
+    fi
+    for op in "${OPERANDS[@]}"; do
+        normalize_operand "$op"
+        rc=$?
+        if [ "$rc" -eq 10 ]; then
+            if [ "$PROMPT_MODE" = f ]; then
+                record_ok "$op"
+                continue
+            fi
+            say_err "cannot remove $(display_escape "$op"): No such file or directory"
+            record_fail "$EC_FAIL" "$op"
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
+            record_fail "$rc" "$op"
+            continue
+        fi
+        norm=$NORM_PATH
+        assert_path_allowed "$norm"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            record_fail "$rc" "$op"
+            continue
+        fi
+        if [ "$DRY_RUN" -eq 0 ]; then
+            if ! maybe_prompt_operand "$norm"; then
+                record_ok "$norm"
+                continue
+            fi
+        fi
+        ENTERED_SAVE=$op
+        trash_one_resolved "$norm"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            record_ok "$norm"
+        else
+            record_fail "$rc" "$norm"
+        fi
+    done
+    if [ "$TRASH_AUTO_PURGE_VALUE" = true ] && [ "$DRY_RUN" -eq 0 ] && [ "$FINAL_STATUS" -eq 0 ]; then
+        release_lock_if_owned
+        auto_purge || warn "automatic purge failed; trashed data was kept"
+    fi
+}
+
+cmd_rmdir() {
+    local op rc
+    acquire_lock rmdir
+    refuse_if_unresolved
+    for op in "${OPERANDS[@]}"; do
+        rmdir_one "$op"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            record_ok "$op"
+        else
+            record_fail "$rc" "$op"
+        fi
+    done
+}
+
+rmdir_one() {
+    local op="$1" rc cur parent
+    normalize_operand "$op"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        [ "$rc" -eq 10 ] && say_err "not a directory: $op"
+        return "${rc:-1}"
+    fi
+    cur=$NORM_PATH
+    if [ -L "$cur" ] || [ ! -d "$cur" ]; then
+        say_err "not a directory: $cur"
+        return "$EC_FAIL"
+    fi
+    assert_path_allowed "$cur" || return "$EC_SAFETY"
+    if ! dir_is_empty "$cur"; then
+        if [ "$IGNORE_NONEMPTY" -eq 1 ]; then
+            return 0
+        fi
+        say_err "directory not empty: $cur"
+        return "$EC_FAIL"
+    fi
+    DIR_FLAG=1
+    RECURSIVE=0
+    ENTERED_SAVE=$op
+    trash_one_resolved "$cur" || return $?
+    if [ "$PARENTS" -ne 1 ]; then
+        return 0
+    fi
+    parent=$(path_parent "$cur")
+    while [ "$parent" != / ]; do
+        assert_path_allowed "$parent" || return 0
+        if [ -L "$parent" ] || [ ! -d "$parent" ]; then
+            return 0
+        fi
+        if ! dir_is_empty "$parent"; then
+            if [ "$IGNORE_NONEMPTY" -eq 1 ]; then
+                return 0
+            fi
+            say_err "directory not empty: $parent"
+            return "$EC_FAIL"
+        fi
+        ENTERED_SAVE=$parent
+        trash_one_resolved "$parent" || return $?
+        parent=$(path_parent "$parent")
+    done
+    return 0
+}
+
+committed_ids() {
+    local f base
+    [ -d "$STORE_PATH/info" ] || return 0
+    while IFS= read -r -d '' f; do
+        base=$(basename -- "$f" .trashinfo)
+        if valid_id "$base" && { [ -e "$STORE_PATH/files/$base" ] || [ -L "$STORE_PATH/files/$base" ]; }; then
+            if ! entry_busy "$base"; then
+                printf '%s\n' "$base"
+            fi
+        fi
+    done < <(find "$STORE_PATH/info" -name '*.trashinfo' -type f -print0 2>/dev/null)
+}
+
+entry_busy() {
+    local id="$1" d j
+    [ -d "$STORE_PATH/tmp" ] || return 1
+    while IFS= read -r -d '' d; do
+        if [ -f "$d/journal" ]; then
+            j=$(kv_get "$d/journal" EntryID 2>/dev/null || true)
+            state=$(kv_get "$d/journal" State 2>/dev/null || true)
+            if [ "$j" = "$id" ] && [ "$state" != COMMITTED ]; then
+                return 0
+            fi
+        fi
+    done < <(find "$STORE_PATH/tmp" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    return 1
+}
+
+resolve_id() {
+    local want="$1" id hits=0 found="" hexn
+    if valid_id "$want"; then
+        if [ -f "$STORE_PATH/info/$want.trashinfo" ]; then
+            printf '%s' "$want"
+            return 0
+        fi
+        return 1
+    fi
+    hexn=$(printf '%s' "$want" | tr -d '-')
+    case "$want" in
+        *[!0-9a-f-]*) return 1 ;;
+    esac
+    if [ "${#hexn}" -lt 8 ]; then
+        return 1
+    fi
+    while IFS= read -r id; do
+        case "$id" in
+            "$want"*)
+                hits=$((hits + 1))
+                found=$id
+                ;;
+        esac
+    done < <(committed_ids)
+    if [ "$hits" -eq 1 ]; then
+        printf '%s' "$found"
+        return 0
+    fi
+    return 1
+}
+
+list_rows() {
+    local id epoch path otype size line
+    : >"$1"
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        epoch=$(kv_get "$STORE_PATH/info/$id.trashinfo" DeletedEpoch 2>/dev/null || printf 0)
+        path=$(kv_get "$STORE_PATH/info/$id.trashinfo" OriginalPath 2>/dev/null || true)
+        percent_decode_var "$path" || path="invalid"
+        if [ "$path" != invalid ]; then
+            path=$DECODED
+        fi
+        otype=$(kv_get "$STORE_PATH/info/$id.trashinfo" ObjectType 2>/dev/null || printf unknown)
+        size=$(kv_get "$STORE_PATH/info/$id.trashinfo" LogicalBytes 2>/dev/null || printf 0)
+        if [ "${#OPERANDS[@]}" -eq 1 ]; then
+            if ! literal_contains "$path" "${OPERANDS[0]}" && ! literal_contains "$id" "${OPERANDS[0]}"; then
+                continue
+            fi
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$id" "$size" "$otype" "$(percent_encode_stream_var "$path")" >>"$1"
+    done < <(committed_ids)
+}
+
+percent_encode_stream_var() {
+    percent_encode_var "$1"
+    printf '%s' "$ENCODED"
+}
+
+cmd_list() {
+    local rows id epoch size otype enc path
+    if [ ! -d "$STORE_PATH" ]; then
+        if [ "$JSON_FLAG" -eq 1 ]; then
+            emit_json_list ""
+        elif [ "$QUIET" -eq 0 ]; then
+            printf 'ID\tDELETED\tSIZE\tTYPE\tPATH\n'
+        fi
+        return 0
+    fi
+    rows=$(mktemp)
+    list_rows "$rows"
+    if [ "$OLDEST_FIRST" -eq 1 ]; then
+        LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k2,2 -o "$rows" "$rows"
+    else
+        LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 -o "$rows" "$rows"
+    fi
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        emit_json_list "$rows"
+        rm -f -- "$rows"
+        return 0
+    fi
+    if [ "$QUIET" -eq 0 ]; then
+        printf 'ID\tDELETED\tSIZE\tTYPE\tPATH\n'
+    fi
+    while IFS="$(printf '\t')" read -r epoch id size otype enc; do
+        [ -n "${id:-}" ] || continue
+        percent_decode_var "$enc" || continue
+        path=$DECODED
+        if [ "$QUIET" -eq 1 ]; then
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$(date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' "$epoch")" "$(format_iec "$size")" "$otype" "$(display_escape "$path")"
+        if [ "$LONG_LIST" -eq 1 ]; then
+            printf '  verify=%s checksum=%s\n' \
+                "$(kv_get "$STORE_PATH/info/$id.trashinfo" Verification 2>/dev/null || true)" \
+                "$(kv_get "$STORE_PATH/info/$id.trashinfo" Checksum 2>/dev/null || true)"
+        fi
+    done <"$rows"
+    rm -f -- "$rows"
+}
+
+cmd_info() {
+    local id
+    if [ ! -d "$STORE_PATH" ]; then
+        die "$EC_FAIL" "no such entry"
+    fi
+    id=$(resolve_id "${OPERANDS[0]}") || die "$EC_FAIL" "no such entry or ambiguous id"
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        emit_json_info "$id"
+        return 0
+    fi
+    printf 'id: %s\n' "$id"
+    printf 'metadata: %s\n' "$STORE_PATH/info/$id.trashinfo"
+    printf 'payload: %s\n' "$STORE_PATH/files/$id"
+    awk -F= '{printf "%s: %s\n", $1, substr($0, index($0, "=")+1)}' "$STORE_PATH/info/$id.trashinfo"
+}
+
+confirm_irreversible() {
+    local msg="$1"
+    if [ "$DRY_RUN" -eq 1 ] || [ "$PROMPT_MODE" = f ]; then
+        return 0
+    fi
+    if ! have_tty; then
+        die "$EC_USAGE" "noninteractive irreversible action requires --force"
+    fi
+    if prompt_line "$msg"; then
+        return 0
+    fi
+    if [ "$QUIET" -eq 0 ]; then
+        printf 'cancelled\n'
+    fi
+    exit "$EC_OK"
+}
+
+delete_entry_locked() {
+    local id="$1" tx payload meta
+    payload="$STORE_PATH/files/$id"
+    meta="$STORE_PATH/info/$id.trashinfo"
+    [ -f "$meta" ] || return "$EC_FAIL"
+    [ -e "$payload" ] || [ -L "$payload" ] || return "$EC_INTEGRITY"
+    tx=$(gen_id) || return "$EC_CAPABILITY"
+    mkdir -m 700 -- "$STORE_PATH/tmp/$tx" || return "$EC_FAIL"
+    write_journal "$tx" PREPARED "$id" delete "$payload" "-" "-" "-" "-" "$payload" "permanent-delete" || return "$EC_INTEGRITY"
+    log_event DELETE "$tx" "$id" "$payload" "-" "intent" || true
+    if ! remove_tree "$payload"; then
+        write_journal "$tx" SOURCE_REMOVED "$id" delete "$payload" "-" "-" "-" "-" "$payload" "delete-incomplete" || true
+        say_err "payload removal incomplete for $id; metadata retained"
+        return "$EC_INTEGRITY"
+    fi
+    "$SYS_RM" -f -- "$meta" "$STORE_PATH/info/$id.manifest" || return "$EC_INTEGRITY"
+    write_journal "$tx" COMMITTED "$id" delete "$payload" "-" "-" "-" "-" "$payload" "deleted" || true
+    "$SYS_RM" -f -- "$STORE_PATH/tmp/$tx/journal" 2>/dev/null || true
+    "$SYS_RMDIR" -- "$STORE_PATH/tmp/$tx" 2>/dev/null || true
+    log_event DELETE "$tx" "$id" "$payload" "-" "deleted" || true
+    return 0
+}
+
+cmd_delete() {
+    local id
+    if [ ! -d "$STORE_PATH" ]; then
+        die "$EC_FAIL" "no such entry"
+    fi
+    acquire_lock delete
+    refuse_if_unresolved
+    id=$(resolve_id "${OPERANDS[0]}") || die "$EC_FAIL" "no such entry or ambiguous id"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would permanently delete %s\n' "$id"
+        return 0
+    fi
+    release_lock_if_owned
+    confirm_irreversible "Permanently delete 1 entry ($id)? This cannot be undone. "
+    acquire_lock delete
+    id=$(resolve_id "${OPERANDS[0]}") || die "$EC_FAIL" "entry changed; aborted"
+    delete_entry_locked "$id" || note_status $?
+}
+
+snapshot_ids() {
+    committed_ids | LC_ALL=C sort >"$1"
+}
+
+cmd_empty() {
+    local snap count oldest size id s
+    if [ ! -d "$STORE_PATH" ]; then
+        [ "$QUIET" -eq 0 ] && printf 'nothing to empty\n'
+        return 0
+    fi
+    acquire_lock empty
+    if unresolved_journals; then
+        die "$EC_INTEGRITY" "refusing --empty while unresolved entries exist; run --doctor"
+    fi
+    snap=$(mktemp)
+    snapshot_ids "$snap"
+    count=$(wc -l <"$snap" | tr -d ' ')
+    if [ "$count" -eq 0 ]; then
+        [ "$QUIET" -eq 0 ] && printf 'nothing to empty\n'
+        rm -f -- "$snap"
+        return 0
+    fi
+    size=0
+    oldest=""
+    while IFS= read -r id; do
+        s=$(kv_get "$STORE_PATH/info/$id.trashinfo" AllocatedBytes 2>/dev/null || printf 0)
+        if is_uint "$s"; then
+            size=$((size + s))
+        fi
+        e=$(kv_get "$STORE_PATH/info/$id.trashinfo" DeletedEpoch 2>/dev/null || true)
+        if [ -z "$oldest" ] || { [ -n "$e" ] && [ "$e" -lt "$oldest" ]; }; then
+            oldest=$e
+        fi
+    done <"$snap"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would permanently delete %s entries (%s), oldest %s\n' "$count" "$(format_iec "$size")" "${oldest:-unknown}"
+        rm -f -- "$snap"
+        return 0
+    fi
+    release_lock_if_owned
+    confirm_irreversible "Permanently delete ${count} entries, $(format_iec "$size"), oldest ${oldest:-unknown}? This cannot be undone. "
+    acquire_lock empty
+    local snap2
+    snap2=$(mktemp)
+    snapshot_ids "$snap2"
+    if ! cmp -s "$snap" "$snap2"; then
+        rm -f -- "$snap" "$snap2"
+        die "$EC_FAIL" "store changed after confirmation; aborted"
+    fi
+    while IFS= read -r id; do
+        delete_entry_locked "$id" || die "$EC_INTEGRITY" "empty stopped on $id"
+    done <"$snap"
+    log_event EMPTY "-" "-" "-" "-" "emptied $count" || true
+    rm -f -- "$snap" "$snap2"
+}
+
+auto_purge() {
+    TRASH_AUTO_PURGE_VALUE=true
+    cmd_purge_inner 1
+}
+
+cmd_purge() {
+    cmd_purge_inner 0
+}
+
+cmd_purge_inner() {
+    local automatic="$1" now age_limit size_limit id epoch alloc snap
+    if [ ! -d "$STORE_PATH" ]; then
+        return 0
+    fi
+    if [ "$automatic" -eq 1 ]; then
+        local stamp="$STORE_PATH/log/auto-purge-epoch" last
+        if [ -f "$stamp" ]; then
+            last=$(cat "$stamp" 2>/dev/null || printf 0)
+            now=$(epoch_now)
+            if is_uint "$last" && [ $((now - last)) -lt "$TRASH_AUTO_PURGE_INTERVAL_VALUE" ]; then
+                return 0
+            fi
+        fi
+    fi
+    acquire_lock purge
+    refuse_if_unresolved || return $?
+    now=$(epoch_now)
+    if [ -n "$OLDER_THAN_ARG" ]; then
+        age_limit=$OLDER_THAN_ARG
+    elif [ "$TRASH_MAX_DAYS_VALUE" = off ]; then
+        age_limit=""
+    else
+        age_limit=$((TRASH_MAX_DAYS_VALUE * 86400))
+    fi
+    if [ -n "$MAX_SIZE_ARG" ]; then
+        size_limit=$MAX_SIZE_ARG
+    else
+        size_limit=$TRASH_MAX_SIZE_VALUE
+    fi
+    snap=$(mktemp)
+    : >"$snap"
+    while IFS= read -r id; do
+        epoch=$(kv_get "$STORE_PATH/info/$id.trashinfo" DeletedEpoch)
+        if [ "$epoch" -gt "$now" ]; then
+            warn "future deletion timestamp on $id; not age-purged"
+            continue
+        fi
+        if [ -n "$age_limit" ] && [ $((now - epoch)) -ge "$age_limit" ]; then
+            printf 'age\t%s\t%s\n' "$epoch" "$id" >>"$snap"
+        fi
+    done < <(committed_ids)
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would purge %s age-eligible entries\n' "$(wc -l <"$snap" | tr -d ' ')"
+        rm -f -- "$snap"
+        return 0
+    fi
+    if [ "$automatic" -eq 0 ]; then
+        local n
+        n=$(wc -l <"$snap" | tr -d ' ')
+        release_lock_if_owned
+        if [ "$n" -gt 0 ]; then
+            confirm_irreversible "Purge ${n} expired entries? This cannot be undone. "
+        fi
+        acquire_lock purge
+    fi
+# shellcheck disable=SC2094  # rm snap only on error path
+    while IFS="$(printf '\t')" read -r _kind epoch id; do
+        [ -n "${id:-}" ] || continue
+        delete_entry_locked "$id" || {
+            say_err "purge stopped on $id"
+            rm -f -- "$snap"
+            return "$EC_INTEGRITY"
+        }
+    done <"$snap"
+    if [ "$size_limit" != off ]; then
+        local total=0 unknown=0
+        while IFS= read -r id; do
+            alloc=$(kv_get "$STORE_PATH/info/$id.trashinfo" AllocatedBytes 2>/dev/null || printf unknown)
+            if [ "$alloc" = unknown ] || ! is_uint "$alloc"; then
+                unknown=1
+                break
+            fi
+            total=$((total + alloc))
+        done < <(committed_ids)
+        if [ "$unknown" -eq 1 ]; then
+            warn "unknown allocation; size purge skipped"
+        else
+            while [ "$total" -gt "$size_limit" ]; do
+                id=$(committed_ids | while IFS= read -r i; do
+                    e=$(kv_get "$STORE_PATH/info/$i.trashinfo" DeletedEpoch)
+                    printf '%s\t%s\n' "$e" "$i"
+                done | LC_ALL=C sort -k1,1n -k2,2 | awk 'NR==1{print $2}')
+                [ -n "$id" ] || break
+                alloc=$(kv_get "$STORE_PATH/info/$id.trashinfo" AllocatedBytes)
+                delete_entry_locked "$id" || return "$EC_INTEGRITY"
+                total=$((total - alloc))
+            done
+        fi
+    fi
+    if [ "$automatic" -eq 1 ]; then
+        epoch_now >"$STORE_PATH/log/auto-purge-epoch" || true
+    fi
+    log_event PURGE "-" "-" "-" "-" "purge complete" || true
+    rm -f -- "$snap"
+}
+
+cmd_permanent() {
+    local op rc args=()
+    ensure_tools
+    if [ "$RECURSIVE" -eq 1 ]; then
+        args+=(-R)
+    fi
+    if [ "$DIR_FLAG" -eq 1 ]; then
+        args+=(-d)
+    fi
+    case "$PROMPT_MODE" in
+        f) args+=(-f) ;;
+        i) args+=(-i) ;;
+        I) args+=(-I) ;;
+    esac
+    if [ "$VERBOSE" -eq 1 ]; then
+        args+=(-v)
+    fi
+    for op in "${OPERANDS[@]}"; do
+        normalize_operand "$op"
+        rc=$?
+        if [ "$rc" -eq 10 ]; then
+            if [ "$PROMPT_MODE" != f ]; then
+                say_err "cannot remove $op: No such file or directory"
+                record_fail "$EC_FAIL" "$op"
+            fi
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
+            record_fail "$rc" "$op"
+            continue
+        fi
+        assert_path_allowed "$NORM_PATH" || {
+            record_fail "$EC_SAFETY" "$op"
+            continue
+        }
+        if [ -d "$NORM_PATH" ] && [ ! -L "$NORM_PATH" ] && tree_crosses_mount "$NORM_PATH"; then
+            say_err "refusing permanent removal that crosses a mount: $NORM_PATH"
+            record_fail "$EC_SAFETY" "$op"
+            continue
+        fi
+        PERM_PATHS+=("$NORM_PATH")
+    done
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        die "$FINAL_STATUS" "permanent mode refused before any deletion"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would run %s' "$SYS_RM"
+        if [ "${#args[@]}" -gt 0 ]; then
+            printf ' %s' "${args[@]}"
+        fi
+        printf ' --'
+        if [ "${#PERM_PATHS[@]}" -gt 0 ]; then
+            printf ' %s' "${PERM_PATHS[@]}"
+        fi
+        printf '\n'
+        return 0
+    fi
+    if [ "$PROMPT_MODE" != f ] && [ "$PROMPT_MODE" != i ] && [ "$PROMPT_MODE" != I ]; then
+        confirm_irreversible "Permanently delete without trash? This cannot be undone. "
+    fi
+    if [ "${#PERM_PATHS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    log_event PERMANENT "-" "-" "-" "-" "intent" || true
+    if [ "${#args[@]}" -gt 0 ]; then
+        "$SYS_RM" "${args[@]}" -- "${PERM_PATHS[@]}"
+    else
+        "$SYS_RM" -- "${PERM_PATHS[@]}"
+    fi
+    rc=$?
+    log_event PERMANENT "-" "-" "-" "-" "status=$rc" || warn "permanent deletion finished but logging failed"
+    return "$rc"
+}
+
+cmd_stats() {
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        emit_json_stats
+        return 0
+    fi
+    printf 'store: %s\n' "$STORE_PATH"
+    if [ ! -d "$STORE_PATH" ]; then
+        printf 'entries: 0\n'
+        return 0
+    fi
+    printf 'checksum: %s\n' "$TRASH_CHECKSUM_VALUE"
+    printf 'auto_purge: %s\n' "$TRASH_AUTO_PURGE_VALUE"
+    printf 'max_days: %s\n' "$TRASH_MAX_DAYS_VALUE"
+    printf 'max_size: %s\n' "$TRASH_MAX_SIZE_VALUE"
+    printf 'committed: %s\n' "$(committed_ids | wc -l | tr -d ' ')"
+}
+
+cmd_doctor() {
+    if [ "$DOCTOR_REPAIR" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        acquire_lock doctor
+    fi
+    run_doctor
+}
+
+run_doctor() {
+    local healthy=0 warn_n=0 err_n=0 orphan=0 quar=0 checksum_fail=0 busy=0
+    if [ ! -d "$STORE_PATH" ]; then
+        if [ "$JSON_FLAG" -eq 1 ]; then
+            emit_json_doctor 0 0 0 0 0 0 0
+        else
+            printf 'store absent: %s\n' "$STORE_PATH"
+            printf 'healthy=0 warning=0 error=0\n'
+        fi
+        return 0
+    fi
+    if ! store_marker_ok; then
+        err_n=$((err_n + 1))
+        say_err "store marker missing or invalid"
+    fi
+    if [ -d "$STORE_PATH/quarantine" ]; then
+        quar=$(find "$STORE_PATH/quarantine" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    if [ -d "$STORE_PATH/files" ]; then
+        while IFS= read -r -d '' p; do
+            base=$(basename -- "$p")
+            if [ ! -f "$STORE_PATH/info/$base.trashinfo" ]; then
+                orphan=$((orphan + 1))
+                err_n=$((err_n + 1))
+                say_err "orphan payload: $base"
+                if [ "$DOCTOR_REPAIR" -eq 1 ]; then
+                    repair_orphan_payload "$base"
+                fi
+            fi
+        done < <(find "$STORE_PATH/files" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    fi
+    if [ -d "$STORE_PATH/info" ]; then
+        while IFS= read -r -d '' f; do
+            base=$(basename -- "$f" .trashinfo)
+            if [ ! -e "$STORE_PATH/files/$base" ] && [ ! -L "$STORE_PATH/files/$base" ]; then
+                err_n=$((err_n + 1))
+                say_err "metadata without payload: $base"
+            else
+                if entry_busy "$base"; then
+                    busy=$((busy + 1))
+                else
+                    healthy=$((healthy + 1))
+                fi
+                sum=$(kv_get "$f" Checksum 2>/dev/null || true)
+                algo=$(kv_get "$f" ChecksumAlgorithm 2>/dev/null || true)
+                otype=$(kv_get "$f" ObjectType 2>/dev/null || true)
+                if [ "$algo" = sha256 ] && [ "$sum" != absent ] && [ "$otype" = file ]; then
+                    require_hash
+                    now=$(sha256_file "$STORE_PATH/files/$base" 2>/dev/null || true)
+                    if [ "$now" != "$sum" ]; then
+                        checksum_fail=$((checksum_fail + 1))
+                        err_n=$((err_n + 1))
+                        say_err "checksum mismatch: $base"
+                    fi
+                fi
+            fi
+        done < <(find "$STORE_PATH/info" -name '*.trashinfo' -type f -print0 2>/dev/null)
+    fi
+    if [ -d "$STORE_PATH/tmp" ]; then
+        while IFS= read -r -d '' d; do
+            busy=$((busy + 1))
+            if [ "$DOCTOR_REPAIR" -eq 1 ]; then
+                repair_transaction "$d"
+            else
+                warn "active or incomplete transaction: $(basename -- "$d")"
+                warn_n=$((warn_n + 1))
+            fi
+        done < <(find "$STORE_PATH/tmp" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    fi
+    if [ "$JSON_FLAG" -eq 1 ]; then
+        emit_json_doctor "$healthy" "$warn_n" "$err_n" "$orphan" "$quar" "$checksum_fail" "$busy"
+    else
+        printf 'healthy=%s warning=%s error=%s orphan=%s quarantined=%s checksum_failure=%s busy=%s\n' \
+            "$healthy" "$warn_n" "$err_n" "$orphan" "$quar" "$checksum_fail" "$busy"
+    fi
+    if [ "$err_n" -gt 0 ] || [ "$checksum_fail" -gt 0 ]; then
+        return "$EC_INTEGRITY"
+    fi
+    if [ "$warn_n" -gt 0 ] || [ "$busy" -gt 0 ]; then
+        return "$EC_FAIL"
+    fi
+    return 0
+}
+
+repair_orphan_payload() {
+    local id="$1" q
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would quarantine orphan payload %s\n' "$id"
+        return 0
+    fi
+    q=$(gen_id) || return 1
+    mkdir -m 700 -- "$STORE_PATH/quarantine/$q" || return 1
+    "$SYS_MV" -- "$STORE_PATH/files/$id" "$STORE_PATH/quarantine/$q/payload" || return 1
+    printf 'FormatVersion=1\nIncidentID=%s\nReason=%s\nEntryID=%s\nGuidance=%s\n' \
+        "$q" "orphan-payload" "$id" "Copy the payload out after validating it. Quarantine is not purged." \
+        >"$STORE_PATH/quarantine/$q/incident"
+    log_event REPAIR "-" "$id" "-" "$q" "quarantined orphan" || true
+}
+
+repair_transaction() {
+    local d="$1" j state id src staging payload
+    j="$d/journal"
+    if [ ! -f "$j" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf 'DRY RUN: would quarantine journal-less transaction %s\n' "$(basename -- "$d")"
+            return 0
+        fi
+        q=$(gen_id) || return 1
+        mkdir -m 700 -- "$STORE_PATH/quarantine/$q"
+        "$SYS_MV" -- "$d" "$STORE_PATH/quarantine/$q/transaction" || return 1
+        printf 'IncidentID=%s\nReason=journal-missing\nGuidance=Inspect preserved files. Do not delete blindly.\n' "$q" >"$STORE_PATH/quarantine/$q/incident"
+        return 0
+    fi
+    state=$(kv_get "$j" State)
+    id=$(kv_get "$j" EntryID)
+    src_enc=$(kv_get "$j" SourcePath)
+    percent_decode_var "$src_enc" || src_enc=""
+    src=$DECODED
+    staging="$d/payload"
+    payload="$STORE_PATH/files/$id"
+    if [ -e "$payload" ] && [ -f "$STORE_PATH/info/$id.trashinfo" ] && [ ! -e "$src" ] && [ ! -L "$src" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf 'DRY RUN: would finalize committed transaction %s\n' "$id"
+            return 0
+        fi
+        "$SYS_RM" -R -- "$d" || true
+        log_event REPAIR "-" "$id" "$src" "$payload" "finalized" || true
+        return 0
+    fi
+    if [ -e "$staging" ] && [ ! -e "$src" ] && [ ! -L "$src" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf 'DRY RUN: would restore staged object to %s\n' "$(display_escape "$src")"
+            return 0
+        fi
+        "$SYS_MV" -- "$staging" "$src" || {
+            q=$(gen_id) || return 1
+            mkdir -m 700 "$STORE_PATH/quarantine/$q"
+            "$SYS_MV" -- "$d" "$STORE_PATH/quarantine/$q/transaction" || true
+            return 0
+        }
+        "$SYS_RM" -R -- "$d" 2>/dev/null || true
+        log_event REPAIR "-" "$id" "$src" "-" "rolled back to source" || true
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would quarantine ambiguous transaction %s\n' "$(basename -- "$d")"
+        return 0
+    fi
+    q=$(gen_id) || return 1
+    mkdir -m 700 -- "$STORE_PATH/quarantine/$q"
+    "$SYS_MV" -- "$d" "$STORE_PATH/quarantine/$q/transaction" || return 1
+    printf 'IncidentID=%s\nReason=ambiguous-transaction\nEntryID=%s\nGuidance=Source data was not deleted. Inspect the transaction directory.\n' "$q" "$id" >"$STORE_PATH/quarantine/$q/incident"
+    log_event REPAIR "-" "$id" "$src" "$q" "quarantined ambiguous transaction" || true
+}
+
+emit_json_error() {
+    local code="$1" err="" item e
+    if [ "${#JSON_ERRORS[@]}" -gt 0 ]; then
+        for item in "${JSON_ERRORS[@]}"; do
+            e=$(json_escape "$item")
+            if [ -n "$err" ]; then
+                err="$err,"
+            fi
+            err="${err}\"${e}\""
+        done
+    fi
+    printf '{"schema_version":1,"command":"%s","ok":false,"dry_run":%s,"data":null,"warnings":[],"errors":[%s],"exit_code":%s}\n' \
+        "$MODE" "$([ "$DRY_RUN" -eq 1 ] && printf true || printf false)" "$err" "$code"
+}
+
+emit_json_list() {
+    local rows="$1" body="" epoch id size otype enc path disp line
+    if [ -n "$rows" ] && [ -f "$rows" ]; then
+        while IFS="$(printf '\t')" read -r epoch id size otype enc; do
+            [ -n "${id:-}" ] || continue
+            percent_decode_var "$enc" || continue
+            path=$DECODED
+            percent_encode_var "$path"
+            disp=null
+            if utf8_ok "$path"; then
+                disp="\"$(json_escape "$path")\""
+            fi
+            line=$(printf '{"id":"%s","deleted_epoch":%s,"logical_bytes":%s,"object_type":"%s","original_path":{"encoding":"percent","value":"%s"},"display_path":%s}' \
+                "$id" "$epoch" "$size" "$otype" "$ENCODED" "$disp")
+            if [ -n "$body" ]; then
+                body="${body},${line}"
+            else
+                body=$line
+            fi
+        done <"$rows"
+    fi
+    printf '{"schema_version":1,"command":"list","ok":true,"dry_run":%s,"data":{"entries":[%s]},"warnings":[],"errors":[]}\n' \
+        "$([ "$DRY_RUN" -eq 1 ] && printf true || printf false)" "$body"
+}
+
+emit_json_info() {
+    local id="$1" path enc
+    path=$(kv_get "$STORE_PATH/info/$id.trashinfo" OriginalPath)
+    percent_decode_var "$path" || true
+    percent_encode_var "$DECODED"
+    enc=$ENCODED
+    printf '{"schema_version":1,"command":"info","ok":true,"dry_run":false,"data":{"id":"%s","metadata_path":{"encoding":"percent","value":"%s"},"payload_path":{"encoding":"percent","value":"%s"},"original_path":{"encoding":"percent","value":"%s"}},"warnings":[],"errors":[]}\n' \
+        "$id" "$(json_escape "$STORE_PATH/info/$id.trashinfo")" "$(json_escape "$STORE_PATH/files/$id")" "$enc"
+}
+
+emit_json_stats() {
+    local n=0
+    if [ -d "$STORE_PATH/info" ]; then
+        n=$(committed_ids | wc -l | tr -d ' ')
+    fi
+    printf '{"schema_version":1,"command":"stats","ok":true,"dry_run":false,"data":{"store":{"encoding":"percent","value":"%s"},"committed":%s,"checksum":"%s","auto_purge":%s,"limitations":"allocation is live du/stat blocks; hardlinks may be counted once per name"},"warnings":[],"errors":[]}\n' \
+        "$(json_escape "$STORE_PATH")" "$n" "$TRASH_CHECKSUM_VALUE" "$([ "$TRASH_AUTO_PURGE_VALUE" = true ] && printf true || printf false)"
+}
+
+emit_json_doctor() {
+    printf '{"schema_version":1,"command":"doctor","ok":%s,"dry_run":%s,"data":{"healthy":%s,"warning":%s,"error":%s,"orphan":%s,"quarantined":%s,"checksum_failure":%s,"busy":%s,"repair":%s},"warnings":[],"errors":[]}\n' \
+        "$([ "$3" -eq 0 ] && printf true || printf false)" \
+        "$([ "$DRY_RUN" -eq 1 ] && printf true || printf false)" \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" \
+        "$([ "$DOCTOR_REPAIR" -eq 1 ] && printf true || printf false)"
+}
+
+print_help() {
+    cat <<EOF
+safe-rm ${SAFE_RM_VERSION} — recoverable rm and rmdir
+
+Usage:
+  safe-rm [options] path...
+  safe-rm --rmdir [options] directory...
+  safe-rm --list [filter]
+  safe-rm --info <id>
+  safe-rm --restore [<id>] [--to DIR]
+  safe-rm --delete <id>
+  safe-rm --empty
+  safe-rm --purge [--older-than 30d] [--max-size SIZE]
+  safe-rm --stats
+  safe-rm --doctor [--repair]
+  safe-rm --permanent [options] path...
+  safe-rm --help
+  safe-rm --version
+
+Normal removal moves the operand into a private store. It does not permanently
+delete user data except the verified source-removal step of a cross-filesystem
+transfer after a recoverable copy is already stored.
+
+Store (private to safe-rm, not desktop-trash interoperability):
+  \${XDG_DATA_HOME:-\$HOME/.local/share}/Trash
+  Override with TRASH_BASE. An existing unmarked Trash directory is refused.
+
+Aliases for interactive shells only (they do not affect scripts, command rm,
+other shells, or programs that unlink files themselves):
+  alias rm='safe-rm'
+  alias rmdir='safe-rm --rmdir'
+  alias rm-permanent='safe-rm --permanent'
+
+Prompts:
+  -i asks once per top-level operand, including a whole directory tree.
+  -I asks once when there are more than three operands or a recursive directory.
+  These are not native per-child prompts. -f skips removal prompts and the
+  missing-operand error. It does not skip permission, safety, lock, or
+  transfer failures. The last of -f, -i, and -I wins.
+  Delete, empty, purge, and permanent mode ask for y, Y, yes, or YES unless
+  --force is given. Any other answer, including EOF, cancels successfully.
+  TRASH_INTERACTIVE=never skips ordinary removal prompts only. It is not
+  consent for irreversible commands. TRASH_AUTO_PURGE=true is explicit consent
+  to retention deletion without a further prompt. The default is false.
+
+Restore:
+  Restores the original absolute path unless --to DIR is set (basename inside
+  that existing directory). Refuses an occupied destination, including a
+  dangling symlink. --rename picks name.restored-N. --overwrite trashes the
+  destination first and never erases it permanently. --force does not overwrite.
+  Checksum mismatch refuses restore unless --ignore-checksum.
+
+IDs:
+  Full lowercase UUIDs internally. Commands accept a unique hexadecimal prefix
+  of at least eight characters. IDs are never paths or globs.
+
+Protections that -f and configuration cannot disable:
+  /, home, the working directory and its ancestors, mount roots, the store and
+  its ancestors, and TRASH_PROTECT_PATHS. A symlink to a protected directory may
+  be removed when the link itself is outside those locations. Trailing-slash
+  operands that would follow a final symlink are refused. Version 1 also refuses
+  trees that cross a nested mount (--one-file-system is always in effect).
+  --preserve-root is accepted. --no-preserve-root is rejected.
+
+Cross-filesystem copies verify types, modes, sizes, symlink targets, and
+SHA-256 of regular files before source removal. Active writers can still change
+a tree after that check and before removal. Stop writers or snapshot the tree
+when that matters. Sparse allocation and hardlinks to objects outside the tree
+are not preserved as identical relationships. ACLs, xattrs, flags, and macOS
+resource forks are preserved only when the platform copy can be verified;
+otherwise the transfer is refused and the source stays.
+
+Locking uses atomic mkdir of .lock (not flock). A large copy holds the lock.
+Stale locks are recovered only when this host can prove the owner pid is gone.
+Age, permission errors, and pid reuse are not enough. Doctor reports the rest.
+
+Interrupted transactions stay in the journal. SIGKILL and power loss are
+recovered by --doctor, not by traps. Repair may finalize a proven commit, move
+a proven same-device staged object back onto a vacant original path, or
+quarantine the evidence. It does not delete remaining source data or unknown
+payloads. Quarantine is excluded from --empty and --purge. There is no
+automatic quarantine deletion.
+
+Trash is not a backup and does not securely erase data. Removing the safe-rm
+alias or executable does not delete the store. This tool cannot promise
+durability beyond the filesystem and the utilities it calls, and it cannot
+close every time-of-check/time-of-use race with another writer.
+
+JSON reports use schema ${SCHEMA_VERSION}. Authoritative paths are percent-encoded.
+
+Exit codes: 0 success or cancel, 1 ordinary failure, 2 usage or config,
+3 safety refusal, 4 lock, 5 integrity, 6 missing capability, 129/130/143 signals.
+Batch precedence is integrity, safety, capability, lock, then ordinary failure.
+EOF
+}
+
+print_version() {
+    printf 'safe-rm %s\n' "$SAFE_RM_VERSION"
+}
+
+report_batch() {
+    if [ "$VERBOSE" -eq 1 ] || [ "$FAIL_COUNT" -gt 0 ]; then
+        printf 'safe-rm: %s succeeded, %s failed\n' "$OK_COUNT" "$FAIL_COUNT" >&2
+    fi
+}
+
+select_restore_id() {
+    local rows choice n=0 id line
+    if ! have_tty; then
+        die "$EC_USAGE" "--restore without an id needs a terminal"
+    fi
+    rows=$(mktemp)
+    list_rows "$rows"
+    if [ ! -s "$rows" ]; then
+        rm -f -- "$rows"
+        die "$EC_FAIL" "nothing to restore"
+    fi
+    if command -v fzf >/dev/null 2>&1; then
+        line=$(awk -F '\t' '{print $2 "\t" $5}' "$rows" | fzf --delimiter="$(printf '\t')" --with-nth=2 --prompt='restore> ' </dev/tty) || {
+            rm -f -- "$rows"
+            exit 0
+        }
+        id=${line%%$'\t'*}
+        rm -f -- "$rows"
+        printf '%s' "$id"
+        return 0
+    fi
+    while IFS="$(printf '\t')" read -r epoch id size otype enc; do
+        n=$((n + 1))
+        percent_decode_var "$enc" || continue
+        printf '%s) %s %s\n' "$n" "$id" "$(display_escape "$DECODED")" >/dev/tty
+        SELECT_IDS+=("$id")
+    done <"$rows"
+    rm -f -- "$rows"
+    printf 'Select an entry, or q to cancel: ' >/dev/tty
+    if ! IFS= read -r choice </dev/tty; then
+        exit 0
+    fi
+    case "$choice" in
+        q|Q|'') exit 0 ;;
+    esac
+    is_uint "$choice" || die "$EC_USAGE" "invalid selection"
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
+        die "$EC_USAGE" "invalid selection"
+    fi
+    printf '%s' "${SELECT_IDS[$((choice - 1))]}"
+}
+
+cmd_restore() {
+    local id dest_dir base dest
+    if [ ! -d "$STORE_PATH" ]; then
+        die "$EC_FAIL" "no such entry"
+    fi
+    if [ "${#OPERANDS[@]}" -eq 0 ]; then
+        id=$(select_restore_id)
+    else
+        id=${OPERANDS[0]}
+    fi
+    acquire_lock restore
+    refuse_if_unresolved
+    id=$(resolve_id "$id") || die "$EC_FAIL" "no such entry or ambiguous id"
+    local enc path
+    enc=$(kv_get "$STORE_PATH/info/$id.trashinfo" OriginalPath)
+    percent_decode_var "$enc" || die "$EC_INTEGRITY" "metadata path cannot be decoded"
+    path=$DECODED
+    base=$(path_final "$path")
+    if [ -n "$RESTORE_TO" ]; then
+        [ -d "$RESTORE_TO" ] && [ ! -L "$RESTORE_TO" ] || die "$EC_FAIL" "--to must be an existing directory"
+        dest_dir=$RESTORE_TO
+        dest="${dest_dir%/}/$base"
+    else
+        dest=$path
+        dest_dir=$(path_parent "$dest")
+        if [ ! -d "$dest_dir" ]; then
+            if [ "$RESTORE_CREATE_PARENTS" -ne 1 ]; then
+                die "$EC_FAIL" "missing parent directory: $dest_dir"
+            fi
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf 'DRY RUN: would create parents for %s\n' "$(display_escape "$dest")"
+            else
+                mkdir -p -- "$dest_dir" || die "$EC_FAIL" "cannot create parents"
+                chmod 700 -- "$dest_dir" || die "$EC_FAIL" "cannot protect created parents"
+            fi
+        fi
+    fi
+    assert_path_allowed "$dest" || die "$EC_SAFETY" "restore destination is protected"
+    if is_prefix_path "$STORE_PATH" "$dest"; then
+        die "$EC_SAFETY" "refusing to restore into the trash store"
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if [ "$RESTORE_OVERWRITE" -eq 1 ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf 'DRY RUN: would trash existing %s then restore %s\n' "$(display_escape "$dest")" "$id"
+                return 0
+            fi
+            local saved_recursive
+            saved_recursive=$RECURSIVE
+            RECURSIVE=1
+            OPERANDS=("$dest")
+            trash_one_resolved "$dest" || die "$EC_INTEGRITY" "could not trash existing destination"
+            RECURSIVE=$saved_recursive
+            warn "existing destination saved as ${LAST_ID:-unknown}"
+        elif [ "$RESTORE_RENAME" -eq 1 ]; then
+            local n=1 candidate
+            while [ "$n" -lt 1000 ]; do
+                candidate="${dest}.restored-${n}"
+                if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+                    dest=$candidate
+                    break
+                fi
+                n=$((n + 1))
+            done
+            if [ -e "$dest" ] || [ -L "$dest" ]; then
+                die "$EC_FAIL" "could not choose a restored name"
+            fi
+        else
+            die "$EC_FAIL" "destination exists: $dest"
+        fi
+    fi
+    local algo sum payload
+    algo=$(kv_get "$STORE_PATH/info/$id.trashinfo" ChecksumAlgorithm)
+    sum=$(kv_get "$STORE_PATH/info/$id.trashinfo" Checksum)
+    payload="$STORE_PATH/files/$id"
+    if [ "$algo" = sha256 ] && [ "$sum" != absent ]; then
+        require_hash
+        local otype now
+        otype=$(kv_get "$STORE_PATH/info/$id.trashinfo" ObjectType)
+        if [ "$otype" = file ]; then
+            now=$(sha256_file "$payload") || now=""
+            if [ "$now" != "$sum" ]; then
+                if [ "$IGNORE_CHECKSUM" -eq 1 ]; then
+                    warn "checksum mismatch ignored for $id"
+                    log_event RESTORE "-" "$id" "$payload" "$dest" "ignore-checksum" || true
+                else
+                    die "$EC_INTEGRITY" "checksum mismatch; restore refused for $id"
+                fi
+            fi
+        fi
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY RUN: would restore %s to %s\n' "$id" "$(display_escape "$dest")"
+        return 0
+    fi
+    local pdev ddev
+    pdev=$(stat_device "$payload")
+    ddev=$(stat_device "$dest_dir")
+    if [ "$pdev" = "$ddev" ]; then
+        "$SYS_MV" -n -- "$payload" "$dest" || die "$EC_INTEGRITY" "restore publish failed; trash copy kept"
+    else
+        copy_payload "$payload" "$dest" || die "$EC_INTEGRITY" "restore copy failed; trash copy kept"
+        "$SYS_RM" -R -- "$payload" || die "$EC_INTEGRITY" "restored copy is in place but trash payload remains: $id"
+    fi
+    if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+        die "$EC_INTEGRITY" "restore did not publish $dest"
+    fi
+    "$SYS_RM" -f -- "$STORE_PATH/info/$id.trashinfo" "$STORE_PATH/info/$id.manifest" || warn "restored $dest but metadata cleanup failed for $id"
+    log_event RESTORE "-" "$id" "$payload" "$dest" "restored" || true
+    if [ "$VERBOSE" -eq 1 ]; then
+        printf 'restored %s -> %s\n' "$id" "$(display_escape "$dest")"
+    fi
+}
+
+main() {
+    snapshot_env
+    if [ "$USER_UID" -eq 0 ]; then
+        printf 'safe-rm: refusing to run with effective uid 0\n' >&2
+        exit "$EC_SAFETY"
+    fi
+    detect_stat || {
+        printf 'safe-rm: stat capability is unavailable\n' >&2
+        exit "$EC_CAPABILITY"
+    }
+    detect_hash || true
+    resolve_self || {
+        printf 'safe-rm: cannot resolve this executable\n' >&2
+        exit "$EC_CAPABILITY"
+    }
+    CWD_PHYS=$(pwd -P) || {
+        printf 'safe-rm: cannot resolve the working directory\n' >&2
+        exit "$EC_FAIL"
+    }
+    parse_args "$@"
+    if [ "$PRESERVE_ROOT_FLAG" -eq 1 ]; then
+        debug "preserve-root is mandatory and already in effect"
+    fi
+    if [ "$ONE_FS_FLAG" -eq 1 ]; then
+        debug "one-file-system traversal refusal is already in effect"
+    fi
+    if [ "$MODE" = help ]; then
+        print_help
+        exit 0
+    fi
+    if [ "$MODE" = version ]; then
+        print_version
+        exit 0
+    fi
+    validate_mode_flags
+    load_configuration
+    prepare_store_path
+    case "$MODE" in
+        trash)
+            ensure_tools
+            cmd_trash
+            ;;
+        rmdir)
+            ensure_tools
+            cmd_rmdir
+            ;;
+        list) cmd_list ;;
+        info) cmd_info ;;
+        restore)
+            ensure_tools
+            cmd_restore
+            ;;
+        delete)
+            ensure_tools
+            cmd_delete
+            ;;
+        empty)
+            ensure_tools
+            cmd_empty
+            ;;
+        purge)
+            ensure_tools
+            cmd_purge
+            ;;
+        stats) cmd_stats ;;
+        doctor)
+            ensure_tools
+            cmd_doctor || note_status $?
+            ;;
+        permanent)
+            cmd_permanent || note_status $?
+            ;;
+        *)
+            usage "unknown mode"
+            ;;
+    esac
+    report_batch
+    exit "$FINAL_STATUS"
+}
+
+PERM_PATHS=()
+LAST_ID=""
+LAST_INCIDENT=""
+CS_ALGO="none"
+CS_VALUE="absent"
+CS_REASON="absent"
+MANIFEST_SHA=""
+ENTERED_PATH=""
+ENTERED_SAVE=""
+
+main "$@"
