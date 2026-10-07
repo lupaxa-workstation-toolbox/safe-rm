@@ -13,7 +13,7 @@
 #
 # shellcheck shell=bash
 
-SAFE_RM_VERSION="0.1.0"
+SAFE_RM_VERSION="0.1.1"
 
 set -u
 set -o pipefail
